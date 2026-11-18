@@ -24,7 +24,9 @@ OUT="$ROOT/docs/firmware/HAN-433-Scanner.bin"
 command -v "$ACLI" >/dev/null 2>&1 || [ -x "$ACLI" ] || { echo "arduino-cli not found at: $ACLI (set ACLI=...)" >&2; exit 1; }
 
 # Where arduino-cli keeps its cores, for boot_app0.bin and its esptool.
-DATA=$("$ACLI" "${CFG[@]}" config dump | sed -n 's/^ *data: *//p' | head -1)
+#   arduino-cli 1.x: "config get"; 0.35 (inside Arduino IDE 2): only "config dump" has it.
+DATA=$("$ACLI" "${CFG[@]}" config get directories.data 2>/dev/null) || DATA=""
+[ -d "$DATA" ] || DATA=$("$ACLI" "${CFG[@]}" config dump | sed -n 's/^ *data: *//p' | head -1)
 CORE="$DATA/packages/esp32/hardware/esp32/2.0.17"
 [ -d "$CORE" ] || { echo "ESP32 core 2.0.17 not installed in $DATA (arduino-cli core install esp32:esp32@2.0.17)" >&2; exit 1; }
 
