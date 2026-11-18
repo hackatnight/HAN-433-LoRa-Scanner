@@ -63,9 +63,11 @@
   </div>
 
   <h3>What this build does</h3>
-  <p>It's the bring-up test: it confirms the radio answers and prints the live channel
-  signal level over USB serial at <code>115200</code> baud. Open a serial monitor after
-  flashing and you should see <code>Radio found</code> followed by a stream of RSSI readings.</p>
+  <p>A single-channel signal meter on 433.000 MHz. The screen shows the live level in dBm,
+  a level bar with peak hold, the noise floor, and a scrolling history graph. Key a
+  433 MHz radio nearby and the bar jumps. Tap the screen to reset the peak. Readings are
+  also printed over USB serial at <code>115200</code> baud. If the radio isn't wired
+  correctly, the screen says <code>Radio NOT found</code>.</p>
 
   <h3>Flashing failed, or want a clean slate?</h3>
   <p>Hold <strong>BOOT</strong> and tap <strong>RESET</strong> on the board to force the

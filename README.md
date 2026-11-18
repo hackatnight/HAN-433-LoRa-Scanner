@@ -10,10 +10,28 @@ radio wired to it.
 
 ## Status
 
-Bring-up. The current build only confirms the radio answers over SPI and prints the live
-channel RSSI over USB serial at `115200` baud. No display yet. Next steps: on-screen
-signal meter, a full-band sweep (the "what's in my air" waterfall), and timestamped
+Single-channel RSSI meter on 433.000 MHz. The screen shows the live signal level in dBm,
+a level bar with a peak-hold marker, the estimated noise floor, and a scrolling history
+graph. Colors show how far the signal sits above the noise floor: blue is noise, then
+green, yellow and red. Tap the screen to reset the peak. The level is also printed over
+USB serial at `115200` baud.
+
+Each on-screen reading is the loudest of the samples taken in its 100 ms frame (one
+sample every 5 ms), so short bursts aren't missed. It reads a few dB above a single
+idle sample for the same reason.
+
+Next steps: a full-band sweep (the "what's in my air" waterfall), and timestamped
 detection logging to the SD card.
+
+## Screen and touch pins (built in)
+
+| Part | Pins |
+|---|---|
+| ILI9341V screen | SCLK `14`, MOSI `13`, CS `15`, DC `2`, backlight `27` (no SDO pin) |
+| XPT2046 touch | SCLK `14`, DIN `13`, DOUT `4` (not 12), CS `33`, PENIRQ `36`, 600 kHz |
+
+The screen and touch share HSPI. The radio has its own bus (VSPI), so the two never
+contend.
 
 ## The radio wiring (two cables)
 
