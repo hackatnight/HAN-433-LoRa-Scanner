@@ -10,14 +10,28 @@ radio wired to it.
 
 ## Status
 
-Two screens, switched with the **METER** / **SWEEP** tabs at the bottom (a short press
-of **BOOT** also switches):
+Two tabs at the bottom, **RX** and **TX**, with the menu look of H@N-CYD-GBC.
+
+**RX** has two screens, switched with the header button (a short press of **BOOT**
+also switches):
 
 - **Meter** - one channel, 433.000 MHz: big dBm readout, level bar with peak hold, the
   estimated noise floor and a scrolling history graph. Tap to reset the peak. Each
   reading is the loudest sample in its 100 ms frame, so short bursts aren't missed.
 - **Sweep** - 430.00 to 439.95 MHz in 50 kHz steps: a live spectrum with a max-hold
   trace over a scrolling waterfall. Tap to clear the max hold.
+
+**TX** is a test transmitter. Tap a row to change it, then **TRANSMIT**:
+
+- Frequency: 430.000 to 439.995 MHz, picked with step buttons (5 kHz to 1 MHz)
+- Power: 2, 5, 10, 14 or 17 dBm (starts at 2)
+- Signal: a plain carrier, or a 1 kHz tone an FM receiver can hear
+- Length: 0.5, 1, 2 or 5 s. A tap or BOOT stops it early.
+
+The SX1278 has no audio input, so the tone is made in software: the radio sends a
+carrier and the firmware rewrites its frequency registers along a 16-step sine,
+16 times per cycle (+-3 kHz deviation at 1 kHz). The settings are remembered.
+Transmitting on 70 cm needs an amateur license (or stay within your local ISM rules).
 
 Colors show how far a signal sits above the noise floor: blue is noise, then green,
 yellow and red. Readings are also printed over USB serial at `115200` baud.
@@ -94,3 +108,11 @@ tools/build.sh flash COM4   # build, then write it to a board
 
 On Windows, `tools\dev.ps1 -Flash -Log 60` builds, flashes and shows 60 seconds of
 filtered serial output in one step.
+
+## Reusing the UI
+
+`src/han_ui.h` is the H@N-CYD-GBC menu look in one file: themes, the gradient header
+with twinkling stars and a shine along its bronze edge, the glowing selected row,
+rounded rows and buttons, and a tab bar. To use it in another LovyanGFX project,
+declare `lcd`, `SCR_W` and `SCR_H`, include the file, call `applyTheme(0)` once and
+`uiTick()` from the main loop.

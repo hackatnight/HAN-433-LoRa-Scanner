@@ -12,7 +12,7 @@ param(
   [switch]$Flash,
   [int]$Log = 0,
   [string]$Port = 'COM4',
-  [string]$Match = 'TOUCH|CAL|SWEEP|METER|Radio|saved|loaded|calibration|TIME|DET|LOG|rror|Guru|panic|rst:'
+  [string]$Match = 'TOUCH|CAL|SWEEP|METER|TX|Radio|saved|loaded|calibration|TIME|DET|LOG|rror|Guru|panic|rst:'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent

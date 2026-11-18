@@ -1,18 +1,20 @@
-// H@N 433MHz LoRa Module Scanner - RSSI meter and band sweep.
+// H@N 433MHz LoRa Module Scanner - RSSI meter, band sweep and test transmitter.
 //
-// Two screens, switched with the METER / SWEEP tabs along the bottom of the screen
-// (the BOOT button also toggles them):
+// Two tabs along the bottom of the screen, RX and TX. Menus use the H@N-CYD-GBC look
+// (src/han_ui.h).
 //
-//   METER  Listens on one frequency: big dBm readout, level bar with peak hold,
-//          estimated noise floor and a scrolling history graph. Tap to reset the
-//          peak.
-//   SWEEP  Steps across 430.00-439.95 MHz and draws a spectrum (with a max-hold
-//          trace) over a scrolling waterfall - "what's in my air". Tap to clear
-//          the max hold. Signals that rise above the noise floor are logged to
-//          the SD card (/han433_det.csv) with frequency, peak, duration and time.
+//   RX     Two screens, switched with the header button (or a short BOOT press):
+//     METER  Listens on one frequency: big dBm readout, level bar with peak hold,
+//            estimated noise floor and a scrolling history graph. Tap to reset the
+//            peak.
+//     SWEEP  Steps across 430.00-439.95 MHz and draws a spectrum (with a max-hold
+//            trace) over a scrolling waterfall - "what's in my air". Tap to clear
+//            the max hold. Signals that rise above the noise floor are logged to
+//            the SD card (/han433_det.csv) with frequency, peak, duration and time.
+//   TX     Sends a carrier or a 1 kHz FM tone on a chosen frequency, power and length.
 //
-// Both also report over USB serial at 115200 baud. Sending "T<unix ms>" over serial
-// sets the clock (tools/dev.ps1 does it); without it the log has uptime only.
+// Everything also reports over USB serial at 115200 baud. Sending "T<unix ms>" over
+// serial sets the clock (tools/dev.ps1 does it); without it the log has uptime only.
 //
 // Board: Elecrow CrowPanel 2.4" "ESP32 Solo Miner LCD" (SKU DHM04624D).
 //
@@ -136,8 +138,9 @@ public:
 
 static LGFX lcd;
 
-static const int SCR_W = 240;
-static uint16_t C_BG, C_PANEL, C_DIM, C_TEXT, C_ACCENT, C_GRID, C_ALERT;
+static const int SCR_W = 240, SCR_H = 320;
+#include "han_ui.h"
+static uint16_t C_GRID, C_ALERT;   // on top of the theme colors (han_ui.h)
 
 // ---------------------------------------------------------------- shared helpers
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -157,35 +160,14 @@ static uint16_t snrColor(float snr) {
   return lcd.color565(255, 70, 90);                  // very strong / close by
 }
 
-static void drawHeader(const char *right) {
-  lcd.fillRect(0, 0, SCR_W, 26, C_PANEL);
-  lcd.setFont(&fonts::Font2);
-  lcd.setTextDatum(middle_left);
-  lcd.setTextColor(C_ACCENT, C_PANEL);
-  lcd.drawString("H@N 433 SCANNER", 8, 13);
-  lcd.setTextDatum(middle_right);
-  lcd.setTextColor(C_TEXT, C_PANEL);
-  lcd.drawString(right, SCR_W - 8, 13);
-}
-
 // ---------------------------------------------------------------- tab bar
-// Two buttons along the bottom edge. They span the full width and are 34 px tall,
-// so they still work if the touch mapping below is off by a few pixels.
+// RX | TX along the bottom edge. Full width and 34 px tall, so they still work if the
+// touch mapping is off by a few pixels.
 static const int TAB_Y = 286, TAB_H = 34;
 
-static void drawTabs(int active) {   // 0 = METER, 1 = SWEEP
-  const char *names[2] = {"METER", "SWEEP"};
-  lcd.setFont(&fonts::Font2);
-  lcd.setTextDatum(middle_center);
-  for (int i = 0; i < 2; i++) {
-    int x = i * (SCR_W / 2);
-    bool on = (i == active);
-    uint16_t fill = on ? C_PANEL : C_BG;
-    lcd.fillRect(x + 2, TAB_Y + 2, SCR_W / 2 - 4, TAB_H - 4, fill);
-    lcd.drawRect(x + 2, TAB_Y + 2, SCR_W / 2 - 4, TAB_H - 4, on ? C_ACCENT : C_GRID);
-    lcd.setTextColor(on ? C_ACCENT : C_DIM, fill);
-    lcd.drawString(names[i], x + SCR_W / 4, TAB_Y + TAB_H / 2);
-  }
+static void drawTabs(int active) {   // 0 = RX, 1 = TX
+  static const char *const names[2] = {"RX", "TX"};
+  uiTabs(names, 2, active, TAB_Y, TAB_H);
 }
 
 // ---------------------------------------------------------------- touch calibration
@@ -507,7 +489,10 @@ static void pollTouch() {
   was = now;
 }
 
-static bool tapIsOnTabs() { return pendingTap.valid && pendingTap.y >= TAB_Y; }
+// Taps on the tab bar or the header button are navigation; the main loop takes them.
+static bool tapIsOnTabs() {
+  return pendingTap.valid && (pendingTap.y >= TAB_Y || uiHeaderButtonHit(pendingTap.x, pendingTap.y));
+}
 
 // True once for a tap outside the tab bar (consumes it).
 static bool tapped() {
@@ -586,8 +571,8 @@ int graphY(float dbm) { return GRAPH_H - 1 - dbmToPx(dbm, DBM_MIN, DBM_MAX, GRAP
 void drawStatic() {
   lcd.fillScreen(C_BG);
   char buf[24];
-  snprintf(buf, sizeof(buf), "%.3f MHz", METER_FREQ_MHZ);
-  drawHeader(buf);
+  snprintf(buf, sizeof(buf), "METER %.3f", METER_FREQ_MHZ);
+  uiHeader(buf, "Sweep");
 
   lcd.setFont(&fonts::Font2);
   lcd.setTextDatum(top_center);
@@ -918,7 +903,7 @@ void pollSerial() {
 namespace sweep {
 
 // Everything is integer dBm. Spectrum: -130..-10 dBm into 90 px (3/4 px per dB).
-const int X0 = 20, SPEC_Y = 48, SPEC_H = 90, AXIS_Y = SPEC_Y + SPEC_H + 3;
+const int X0 = 20, SPEC_Y = 52, SPEC_H = 90, AXIS_Y = SPEC_Y + SPEC_H + 3;   // below the 32 px header
 
 // Waterfall = ILI9341 hardware vertical scroll. No pixel is ever copied: each sweep
 // writes one new 200-px row and moves the controller's scroll pointer (VSCRSADD).
@@ -1000,6 +985,14 @@ void drawBin(int i) {
   lcd.drawPixel(x, 319 - wfRow, pal[k < 0 ? 0 : k > 63 ? 63 : k]);
 }
 
+// Header: the mode and the detections logged so far; its button goes to METER.
+void title() {
+  shownTotal = detlog::total;
+  char s[32];
+  snprintf(s, sizeof s, sdOk ? "SWEEP  %lu logged" : "SWEEP  %lu, no SD", (unsigned long)shownTotal);
+  uiHeader(s, "Meter");
+}
+
 void enter() {
   radio.beginFSK(430.0, 4.8, 5.0, SWEEP_BW_KHZ);
   radio.startReceive();
@@ -1010,10 +1003,9 @@ void enter() {
 
   for (int i = 0; i < SWEEP_BINS; i++) hold[i] = -130;
   sweepCount = 0;
-  shownTotal = ~0u;   // redraw the log count
 
   lcd.fillScreen(C_BG);
-  drawHeader("SWEEP");
+  title();
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(C_DIM, C_BG);
   lcd.setTextDatum(top_center);
@@ -1026,7 +1018,7 @@ void enter() {
   }
   lcd.setTextDatum(middle_right);                // dBm labels
   for (int d = -110; d <= -30; d += 40) lcd.drawNumber(d, X0 - 2, SPEC_Y + SPEC_H - 1 - specH(d));
-  drawTabs(1);
+  drawTabs(0);                                   // SWEEP is under RX
 
   uint16_t def[3] = {TFA, VSA, BFA};
   lcdMadctl(MADCTL_SWEEP);
@@ -1085,17 +1077,7 @@ bool loop() {
   for (int n = 0; top > 0 && (n += cnt[top]) < SWEEP_BINS / 20; top--) {}
   top -= 140;
   detlog::scan(bins, detlog::SPUR_BIN, floorDbm, top, t0);
-  if (detlog::total != shownTotal) {      // header, right: detections so far
-    shownTotal = detlog::total;
-    char s[20];
-    snprintf(s, sizeof s, sdOk ? "%lu logged" : "%lu det, no SD", (unsigned long)shownTotal);
-    lcd.setFont(&fonts::Font2);
-    lcd.setTextDatum(middle_right);
-    lcd.setTextColor(sdOk ? C_TEXT : C_ALERT, C_PANEL);
-    lcd.setTextPadding(100);
-    lcd.drawString(s, SCR_W - 8, 13);
-    lcd.setTextPadding(0);
-  }
+  if (detlog::total != shownTotal) title();
 
   if (tapped()) for (int i = 0; i < SWEEP_BINS; i++) hold[i] = bins[i];
 
@@ -1106,7 +1088,7 @@ bool loop() {
   lcd.setTextPadding(SCR_W - 16);
   lcd.setTextColor(snr >= 6 ? snrColor(snr) : C_DIM, C_BG);
   snprintf(b, sizeof b, "Peak %d.%02d MHz  %d dBm", binKHz(peak) / 1000, binKHz(peak) % 1000 / 10, bins[peak]);
-  lcd.drawString(b, 8, 29);
+  lcd.drawString(b, 8, UI_HDR_H + 3);
   lcd.setTextPadding(0);
 
   if (++sweepCount % 10 == 0)
@@ -1117,14 +1099,218 @@ bool loop() {
 
 }  // namespace sweep
 
+// ================================================================ TX
+// Test transmitter: a plain carrier, or a 1 kHz FM tone. The SX1278 has no audio input,
+// so the tone is made in software: the radio sends a carrier (FSK continuous mode, zero
+// deviation) and the frequency registers are rewritten along a 16-step sine, 16 times
+// per tone cycle - +-3 kHz at 1 kHz, which an FM receiver plays as a tone.
+// Settings are kept in NVS. A tap or BOOT stops a transmission early.
+namespace tx {
+
+const int POWERS[] = {2, 5, 10, 14, 17};          // dBm out of PA_BOOST
+const int LENGTHS_MS[] = {500, 1000, 2000, 5000};
+const int F_MIN = 430000, F_MAX = 439995;         // kHz
+int fKHz = 433500, powIdx = 0, sig = 1, lenIdx = 1, sel = -1;   // sig: 0 carrier, 1 tone
+
+// 3 kHz deviation in FRF steps (32 MHz / 2^19 = 61.035 Hz): 49 x sin(k x 22.5 deg)
+const int8_t SIN16[16] = {0, 19, 35, 45, 49, 45, 35, 19, 0, -19, -35, -45, -49, -45, -35, -19};
+
+const int ROW_X = 6, ROW_W = SCR_W - 12, ROW_Y = UI_HDR_H + 6, ROW_H = 36, ROW_P = 42;
+const int TX_Y = ROW_Y + 4 * ROW_P + 4, TX_H = 50;      // TRANSMIT button
+const int STATUS_Y = TX_Y + TX_H + 6;
+const char *const LABELS[4] = {"Frequency", "Power", "Signal", "Length"};
+
+void load() {
+  fKHz = constrain((int)prefs.getUInt("txf", fKHz), F_MIN, F_MAX);
+  powIdx = prefs.getUChar("txp", powIdx) % 5;
+  sig = prefs.getUChar("txs", sig) & 1;
+  lenIdx = prefs.getUChar("txl", lenIdx) % 4;
+}
+void save() {
+  prefs.putUInt("txf", fKHz); prefs.putUChar("txp", powIdx);
+  prefs.putUChar("txs", sig); prefs.putUChar("txl", lenIdx);
+}
+
+void value(int r, char *s, int n) {
+  switch (r) {
+    case 0: snprintf(s, n, "%d.%03d MHz", fKHz / 1000, fKHz % 1000); break;
+    case 1: snprintf(s, n, "%d dBm", POWERS[powIdx]); break;
+    case 2: snprintf(s, n, sig ? "Tone 1 kHz" : "Carrier"); break;
+    default: snprintf(s, n, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100); break;
+  }
+}
+void drawRow(int r) {
+  char v[16];
+  value(r, v, sizeof v);
+  int y = ROW_Y + r * ROW_P;
+  uiRow(ROW_X, y, ROW_W, ROW_H, LABELS[r], v, r == sel);
+  if (r == sel) glowSet(ROW_X, y, ROW_W, ROW_H, C_HILITE);
+}
+void drawButton(bool on) {
+  uiButton(ROW_X, TX_Y, ROW_W, TX_H, on ? "TRANSMITTING" : "TRANSMIT",
+           on ? C_ALERT : C_PANEL, C_ALERT, C_TEXT);
+}
+void status(const char *s, uint16_t c) {
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(top_center);
+  lcd.setTextColor(c, C_BG);
+  lcd.setTextPadding(SCR_W - 8);
+  lcd.drawString(s, SCR_W / 2, STATUS_Y);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+void drawAll() {
+  glowOff();
+  lcd.fillScreen(C_BG);
+  uiHeader("TX  test transmitter");
+  for (int r = 0; r < 4; r++) drawRow(r);
+  drawButton(false);
+  status("Tap a row to change it", C_DIM);
+  drawTabs(1);
+}
+
+// Frequency picker, GBC pickNumber style: step buttons, big value, OK. Blocking.
+void pickFreq() {
+  static const char *const lab[8] = {"-1M", "-100k", "+100k", "+1M", "-25k", "-5k", "+5k", "+25k"};
+  static const int step[8] = {-1000, -100, 100, 1000, -25, -5, 5, 25};
+  const int bw = (SCR_W - 5 * 8) / 4, bh = 40, by = 150, oky = SCR_H - 48;
+  int v = fKHz;
+  glowOff();
+  lcd.fillScreen(C_BG);
+  uiHeader("TX frequency", "Back");
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString("430.000 - 439.995 MHz", SCR_W / 2, 50);
+  for (int i = 0; i < 8; i++)
+    uiButton(8 + i % 4 * (bw + 8), by + i / 4 * (bh + 8), bw, bh, lab[i], C_PANEL, C_PANEL, C_TEXT);
+  uiButton(8, oky, SCR_W - 16, 38, "OK", C_HILITE, C_ACCENT, C_TEXT);
+  auto drawValue = [&]() {
+    char b[12];
+    snprintf(b, sizeof b, "%d.%03d", v / 1000, v % 1000);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextSize(3);
+    lcd.setTextColor(C_TEXT, C_BG);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextPadding(SCR_W - 8);
+    lcd.drawString(b, SCR_W / 2, 100);
+    lcd.setTextSize(1);
+    lcd.setTextPadding(0);
+    lcd.setTextDatum(top_left);
+  };
+  drawValue();
+  pendingTap.valid = false;
+  while (true) {
+    uiTick();
+    pollTouch();
+    if (!pendingTap.valid) { delay(10); continue; }
+    pendingTap.valid = false;
+    int x = pendingTap.x, y = pendingTap.y;
+    if (uiHeaderButtonHit(x, y)) return;                   // Back: keep the old value
+    if (y >= oky && y < oky + 38) { fKHz = v; save(); return; }
+    int col = (x - 8) / (bw + 8), row = (y - by) / (bh + 8);
+    if (y >= by && col >= 0 && col < 4 && row >= 0 && row < 2) {
+      v = constrain(v + step[row * 4 + col], F_MIN, F_MAX);
+      drawValue();
+    }
+  }
+}
+
+void send() {
+  const int ms = LENGTHS_MS[lenIdx], dbm = POWERS[powIdx];
+  Serial.printf("TX %d.%03d MHz  %d dBm  %s  %d ms\n", fKHz / 1000, fKHz % 1000, dbm,
+                sig ? "tone 1 kHz" : "carrier", ms);
+  glowOff();
+  drawButton(true);
+  status("Tap or BOOT to stop", C_DIM);
+  const uint32_t frf = (uint64_t)fKHz * 524288 / 32000;  // f x 2^19 / 32 MHz
+  radio.setFrequency(fKHz / 1000.0f);
+  radio.setOutputPower(dbm);
+  radioSPI.beginTransaction(sweep::fastSPI);
+  sweep::rw(0x04, 0); sweep::rw(0x05, 0);                 // RegFdev = 0: a plain carrier
+  radioSPI.endTransaction();
+  radio.transmitDirect();                                 // continuous mode, PA on
+
+  // Stop on BOOT, or on a new touch (the finger that pressed TRANSMIT must lift first).
+  bool armed = false, stopped = false;
+  uint32_t t0 = millis(), next = micros();
+  for (int k = 0; millis() - t0 < (uint32_t)ms; k++) {
+    if (sig) {                                            // next sine step, every 62.5 us
+      while ((int32_t)(micros() - next) < 0) {}
+      next += 62 + (k & 1);
+      uint32_t f = frf + SIN16[k & 15];
+      radioSPI.beginTransaction(sweep::fastSPI);
+      sweep::rw(0x06, f >> 16); sweep::rw(0x07, f >> 8); sweep::rw(0x08, f);
+      radioSPI.endTransaction();
+      if (k & 15) continue;                               // buttons once per tone cycle
+    } else {
+      delay(1);
+    }
+    bool pen = digitalRead(PIN_TP_IRQ) == LOW;
+    if (!pen) armed = true;
+    if ((armed && pen) || digitalRead(PIN_BOOT) == LOW) { stopped = true; break; }
+  }
+  radio.standby();
+  uint32_t dt = millis() - t0;
+  Serial.printf("TX done after %lu ms%s\n", (unsigned long)dt, stopped ? " (stopped)" : "");
+  while (digitalRead(PIN_BOOT) == LOW) delay(10);         // don't let BOOT switch modes
+  bootEvent();
+  pollTouch(); pendingTap.valid = false;                  // the stopping tap is used up
+  drawButton(false);
+  char s[40];
+  snprintf(s, sizeof s, stopped ? "Stopped after %lu ms" : "Sent %lu ms", (unsigned long)dt);
+  status(s, C_TEXT);
+}
+
+void enter() {
+  load();
+  radio.beginFSK(fKHz / 1000.0f, 4.8, 5.0, SWEEP_BW_KHZ);
+  radio.standby();
+  sel = -1;
+  drawAll();
+  Serial.printf("TX ready: %d.%03d MHz\n", fKHz / 1000, fKHz % 1000);
+}
+
+void leave() {
+  glowOff();
+  radio.standby();
+  radio.begin(METER_FREQ_MHZ);                            // LoRa again, as METER expects
+}
+
+void loop() {
+  if (!tapped()) return;
+  int x = pendingTap.x, y = pendingTap.y;
+  (void)x;
+  if (y >= TX_Y && y < TX_Y + TX_H) { send(); return; }
+  int r = (y - ROW_Y) / ROW_P;
+  if (y < ROW_Y || r > 3 || (y - ROW_Y) % ROW_P >= ROW_H) return;
+  int was = sel;
+  sel = r;
+  switch (r) {
+    case 0: pickFreq(); drawAll(); return;
+    case 1: powIdx = (powIdx + 1) % 5; break;
+    case 2: sig ^= 1; break;
+    default: lenIdx = (lenIdx + 1) % 4; break;
+  }
+  save();
+  glowOff();
+  if (was >= 0 && was != r) drawRow(was);
+  drawRow(r);
+}
+
+}  // namespace tx
+
 // ================================================================ main
-enum Mode { MODE_METER, MODE_SWEEP };
-static Mode mode = MODE_METER;
+// Tabs: RX (METER or SWEEP, whichever was last) and TX.
+enum Mode { MODE_METER, MODE_SWEEP, MODE_TX };
+static Mode mode = MODE_METER, rxMode = MODE_METER;
 
 static void switchMode(Mode m) {
-  if (mode == MODE_METER) meter::leave(); else sweep::leave();
+  if (m == mode) return;
+  if (mode == MODE_METER) meter::leave(); else if (mode == MODE_SWEEP) sweep::leave(); else tx::leave();
   mode = m;
-  if (mode == MODE_METER) meter::enter(); else sweep::enter();
+  if (m != MODE_TX) rxMode = m;
+  if (m == MODE_METER) meter::enter(); else if (m == MODE_SWEEP) sweep::enter(); else tx::enter();
 }
 
 void setup() {
@@ -1138,13 +1324,9 @@ void setup() {
   lcd.setRotation(2);                  // portrait, same as H@N-CYD-GBC on this board
   lcd.setBrightness(255);
 
-  C_BG     = lcd.color565(0, 0, 0);
-  C_PANEL  = lcd.color565(3, 45, 99);
-  C_DIM    = lcd.color565(158, 192, 235);
-  C_TEXT   = lcd.color565(238, 246, 255);
-  C_ACCENT = lcd.color565(124, 232, 255);
-  C_GRID   = lcd.color565(20, 32, 60);
-  C_ALERT  = lcd.color565(255, 70, 90);
+  applyTheme(0);                       // H@N Night (han_ui.h)
+  C_GRID  = C_PANEL;
+  C_ALERT = lcd.color565(255, 70, 90);
   sweep::buildPalette();
 
   // Touch calibration. Runs on the first boot, or after BOOT was held 2 s (which sets
@@ -1166,7 +1348,7 @@ void setup() {
   }
 
   lcd.fillScreen(C_BG);
-  drawHeader("");
+  uiHeader("H@N 433 SCANNER");
 
   radioSPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS);
   if (sdOk) sdBus(false);              // card pins idle until a log flush
@@ -1192,8 +1374,8 @@ void loop() {
   detlog::pollSerial();
   detlog::flush();
   int boot = bootEvent();
-  if (boot == 1) {                       // short press: switch mode
-    switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
+  if (boot == 1) {                       // short press: METER <-> SWEEP (in RX)
+    if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
     return;
   }
   if (boot == 2) {                       // held 2 s: restart into touch calibration
@@ -1209,12 +1391,17 @@ void loop() {
     ESP.restart();
   }
   pollTouch();
-  if (tapIsOnTabs()) {
+  if (tapIsOnTabs()) {                   // navigation: header button or RX/TX tabs
     pendingTap.valid = false;
-    Mode want = pendingTap.x < SCR_W / 2 ? MODE_METER : MODE_SWEEP;
-    if (want != mode) switchMode(want);
+    if (pendingTap.y < TAB_Y) {          // header button: METER <-> SWEEP
+      if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
+    } else {
+      switchMode(pendingTap.x < SCR_W / 2 ? rxMode : MODE_TX);
+    }
     return;
   }
+  uiTick();                              // header stars, edge shine, row glow
   if (mode == MODE_METER) meter::loop();
-  else sweep::loop();
+  else if (mode == MODE_SWEEP) sweep::loop();
+  else tx::loop();
 }
