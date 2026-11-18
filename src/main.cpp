@@ -140,6 +140,7 @@ static LGFX lcd;
 
 static const int SCR_W = 240, SCR_H = 320;
 #include "han_ui.h"
+#include "voice_hello.h"
 static uint16_t C_GRID, C_ALERT;   // on top of the theme colors (han_ui.h)
 
 // ---------------------------------------------------------------- shared helpers
@@ -478,7 +479,12 @@ static DragEv pendingDrag = {false, 0, 0};
 // sideways) is a tap at the press point; one that moved further is a drag. Both are
 // latched when the finger lifts, so a press can still turn into a drag.
 static const int DRAG_PX = 15;
+// Serial commands (main section) are read here too, so a "tap" from the PC reaches
+// every screen, menus and pickers included.
+static void (*serialHook)() = nullptr;
+
 static void pollTouch() {
+  if (serialHook && Serial.available()) serialHook();
   static bool down = false;
   static int x0, y0, x1;
   static uint32_t last = 0;
@@ -1005,19 +1011,6 @@ void flush() {
   nBuf = 0;
 }
 
-// "T<unix ms>" + newline from the PC sets the clock.
-void pollSerial() {
-  static char line[24];
-  static uint8_t n;
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c != '\n' && c != '\r') { if (n < sizeof line - 1) line[n++] = c; continue; }
-    line[n] = 0;
-    if (n > 10 && line[0] == 'T') setClock(strtoull(line + 1, nullptr, 10));
-    n = 0;
-  }
-}
-
 }  // namespace detlog
 
 // ================================================================ SWEEP
@@ -1433,9 +1426,16 @@ bool check(int g0) {
     int v = rf::rssi();
     if (v > best) { best = v; bestG = g; }
   }
-  if (best < fl + LOCK_DB) { rf::setBw(rf::BW_250); return false; }
+  // One loud reading can be a noise blip: read the best bin 8 more times, and lock only
+  // if most of them are over the line too.
+  int over = 0;
+  if (best >= fl + LOCK_DB) {
+    rf::tune(gKHz(bestG));
+    delayMicroseconds(1000);
+    for (int k = 0; k < 8; k++) { if (rf::rssi() >= fl + LOCK_DB) over++; delayMicroseconds(250); }
+  }
+  if (over < 5) { rf::setBw(rf::BW_250); return false; }
   lockG = bestG; lockFloor = fl; peak = level = best;
-  rf::tune(gKHz(lockG));
   return true;
 }
 
@@ -1507,16 +1507,21 @@ void sweepOnce() {
 
 // Locked: one 50 ms window of samples per call.
 void listen() {
+  // Noise alone flickers: the loudest of ~50 noise samples is often 10 dB over the floor,
+  // which kept the lock forever. A real carrier sits there, so a window counts as heard
+  // only when at least half its samples are over the line. The bar shows the average.
   uint32_t t0 = millis();
-  int best = -200;
+  int n = 0, over = 0, sum = 0;
   while (millis() - t0 < 50) {
     int v = rf::rssi();
-    if (v > best) best = v;
+    sum += v; n++;
+    if (v >= lockFloor + LOCK_DB) over++;
     delayMicroseconds(900);
   }
+  int avg = sum / n;
   uint32_t now = millis();
-  if (best >= lockFloor + LOCK_DB) { tLast = now; hits++; if (best > peak) peak = best; }
-  bar(best);
+  if (over * 2 >= n) { tLast = now; hits++; if (avg > peak) peak = avg; }
+  bar(avg);
   char s[40];
   snprintf(s, sizeof s, "LOCKED  %lu.%lus  quiet %lu.%lus", (unsigned long)((now - tStart) / 1000),
            (unsigned long)((now - tStart) % 1000 / 100), (unsigned long)((now - tLast) / 1000),
@@ -1538,21 +1543,22 @@ void loop() {
 }  // namespace scan
 
 // ================================================================ TX
-// Test transmitter: a plain carrier, a 1 kHz FM tone, or a 5 s chiptune. The SX1278 has
-// no audio input, so the audio is made in software: the radio sends a carrier (FSK
-// continuous mode, zero deviation) and the firmware keeps rewriting its frequency
-// registers. The tone follows a 16-step sine (+-3 kHz, 16 writes per cycle); the
-// chiptune flips between two frequencies (+-2.5 kHz) at the note's pitch - square-wave
-// FM, which an FM receiver plays as an 8-bit pulse voice. Chords are arpeggios: the
-// notes of the chord taken in turn every ~33 ms, the old trick for one voice.
-// Settings are kept in NVS. A tap or BOOT stops a transmission early.
+// Test transmitter as a sound board: 8 pads, tap one to send it, tap again or BOOT to
+// stop. The SX1278 has no audio input, so the audio is made in software: the radio sends
+// a carrier (FSK continuous mode, zero deviation) and the firmware keeps rewriting its
+// frequency registers - FM by hand. Most sounds are a deviation per 62.5 us tick (16 kHz):
+// sines from a 16-step table (+-3 kHz), square waves (+-2.5 kHz, an 8-bit pulse voice)
+// and the "Hello" voice, 4-bit samples at 8 kHz made by tools/make_voice.ps1. The
+// chiptune flips between two frequencies at exact note half-periods; chords are
+// arpeggios, the notes taken in turn every ~33 ms. Frequency and power are kept in NVS.
 namespace tx {
 
 const int POWERS[] = {2, 5, 10, 14, 17};          // dBm out of PA_BOOST
-const int LENGTHS_MS[] = {500, 1000, 2000, 5000};
 const int F_MIN = 430000, F_MAX = 439995;         // kHz
-enum { SIG_CARRIER, SIG_TONE, SIG_SONG, NUM_SIG };
-int fKHz = 433500, powIdx = 0, sig = SIG_TONE, lenIdx = 1, sel = -1;
+enum { S_HELLO, S_SONG, S_SIREN, S_LASER, S_ROGER, S_MORSE, S_TONE, S_CARRIER, NUM_SND };
+const char *const PADS[NUM_SND] = {"Hello", "Chiptune", "Siren", "Laser", "Roger beep", "Morse H@N",
+                                   "Tone 1 kHz", "Carrier"};
+int fKHz = 433500, powIdx = 0;
 
 // 3 kHz deviation in FRF steps (32 MHz / 2^19 = 61.035 Hz): 49 x sin(k x 22.5 deg)
 const int8_t SIN16[16] = {0, 19, 35, 45, 49, 45, 35, 19, 0, -19, -35, -45, -49, -45, -35, -19};
@@ -1572,46 +1578,34 @@ const int STEP_MS = 100, GAP_MS = 12;             // a short gap ends each note:
 const uint16_t HALF_US4[12] = {1911, 1804, 1703, 1607, 1517, 1432, 1351, 1276, 1204, 1136, 1073, 1012};
 uint32_t halfUs(int midi) { return HALF_US4[midi % 12] >> (midi / 12 - 5) ; }   // midi >= 60
 
-const int ROW_X = 6, ROW_W = SCR_W - 12, ROW_Y = UI_HDR_H + 6, ROW_H = 36, ROW_P = 42;
-const int TX_Y = ROW_Y + 4 * ROW_P + 4, TX_H = 50;      // TRANSMIT button
-const int STATUS_Y = TX_Y + TX_H + 6;
-const char *const LABELS[4] = {"Frequency", "Power", "Signal", "Length"};
+// Layout: frequency and power buttons, a status line, then 2 x 4 pads.
+const int TOP_Y = UI_HDR_H + 6, TOP_H = 32, FREQ_W = 142, POW_X = 6 + FREQ_W + 6;
+const int STATUS_Y = TOP_Y + TOP_H + 5;
+const int PAD_Y = STATUS_Y + 20, PAD_W = (SCR_W - 18) / 2, PAD_H = 40, PAD_P = 46;
 
 void load() {
   fKHz = constrain((int)prefs.getUInt("txf", fKHz), F_MIN, F_MAX);
   powIdx = prefs.getUChar("txp", powIdx) % 5;
-  sig = prefs.getUChar("txs", sig) % NUM_SIG;
-  lenIdx = prefs.getUChar("txl", lenIdx) % 4;
 }
-void save() {
-  prefs.putUInt("txf", fKHz); prefs.putUChar("txp", powIdx);
-  prefs.putUChar("txs", sig); prefs.putUChar("txl", lenIdx);
-}
+void save() { prefs.putUInt("txf", fKHz); prefs.putUChar("txp", powIdx); }
 
 int songMs() { int n = 0; for (auto &s : SONG) n += s.len; return n * STEP_MS; }
 
-void value(int r, char *s, int n) {
-  static const char *const SIGS[NUM_SIG] = {"Carrier", "Tone 1 kHz", "Chiptune"};
-  switch (r) {
-    case 0: snprintf(s, n, "%d.%03d MHz", fKHz / 1000, fKHz % 1000); break;
-    case 1: snprintf(s, n, "%d dBm", POWERS[powIdx]); break;
-    case 2: snprintf(s, n, "%s", SIGS[sig]); break;
-    default:
-      if (sig == SIG_SONG) snprintf(s, n, "%d.%d s (song)", songMs() / 1000, songMs() % 1000 / 100);
-      else snprintf(s, n, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100);
-      break;
-  }
+void drawTop() {
+  char b[16];
+  snprintf(b, sizeof b, "%d.%03d MHz", fKHz / 1000, fKHz % 1000);
+  uiButton(6, TOP_Y, FREQ_W, TOP_H, b, C_PANEL, C_ACCENT, C_TEXT);
+  snprintf(b, sizeof b, "%d dBm", POWERS[powIdx]);
+  uiButton(POW_X, TOP_Y, SCR_W - 6 - POW_X, TOP_H, b, C_PANEL, C_ACCENT, C_TEXT);
 }
-void drawRow(int r) {
-  char v[20];
-  value(r, v, sizeof v);
-  int y = ROW_Y + r * ROW_P;
-  uiRow(ROW_X, y, ROW_W, ROW_H, LABELS[r], v, r == sel);
-  if (r == sel) glowSet(ROW_X, y, ROW_W, ROW_H, C_HILITE);
+void drawPad(int i, bool on) {
+  uiButton(6 + i % 2 * (PAD_W + 6), PAD_Y + i / 2 * PAD_P, PAD_W, PAD_H, PADS[i],
+           on ? C_ALERT : C_PANEL, on ? C_ALERT : C_HILITE, C_TEXT);
 }
-void drawButton(bool on) {
-  uiButton(ROW_X, TX_Y, ROW_W, TX_H, on ? "TRANSMITTING" : "TRANSMIT",
-           on ? C_ALERT : C_PANEL, C_ALERT, C_TEXT);
+int padAt(int x, int y) {
+  int c = (x - 6) / (PAD_W + 6), r = (y - PAD_Y) / PAD_P;
+  if (y < PAD_Y || x < 6 || c > 1 || r > 3 || (y - PAD_Y) % PAD_P >= PAD_H) return -1;
+  return r * 2 + c;
 }
 void status(const char *s, uint16_t c) {
   lcd.setFont(&fonts::Font2);
@@ -1625,10 +1619,10 @@ void status(const char *s, uint16_t c) {
 void drawAll() {
   glowOff();
   lcd.fillScreen(C_BG);
-  uiHeader("TX", "Menu");
-  for (int r = 0; r < 4; r++) drawRow(r);
-  drawButton(false);
-  status("Tap a row to change it", C_DIM);
+  uiHeader("TX  sound board", "Menu");
+  drawTop();
+  status("Tap a pad to transmit", C_DIM);
+  for (int i = 0; i < NUM_SND; i++) drawPad(i, false);
   drawTabs(1);
 }
 
@@ -1687,6 +1681,8 @@ inline void setFrf(uint32_t f) {
 // Stop on BOOT, or on a new touch (the finger that started it must lift first).
 bool armed;
 bool stopNow() {
+  if (serialHook && Serial.available()) serialHook();     // "tap" or "stop" from the PC
+  if (pendingTap.valid) return true;
   bool pen = digitalRead(PIN_TP_IRQ) == LOW;
   if (!pen) armed = true;
   return (armed && pen) || digitalRead(PIN_BOOT) == LOW;
@@ -1711,14 +1707,64 @@ bool playNote(int midi, int arp, uint32_t ms) {
   return true;
 }
 
-// Transmits signal s (SIG_*) on the current frequency and power.
+// ---- the tick sounds: one deviation (FRF steps) per 62.5 us tick, END when done
+const int TICK_HZ = 16000, END = 9999, SQ = SONG_DEV;
+uint16_t ph;                                              // phase, 65536 = one cycle
+inline int sine(int hz) { ph += hz * 4096 / 1000; return SIN16[ph >> 12]; }   // 65536 / 16000
+inline int square(int hz) { ph += hz * 4096 / 1000; return ph & 0x8000 ? SQ : -SQ; }
+
+// Morse "H@N" at 20 WPM: 1 = key down for one 60 ms unit, 0 = up. Built on first use.
+const char *const MORSE = ".... .--.-. -.";
+uint8_t morse[64];
+int morseN;
+void buildMorse() {
+  morseN = 0;
+  for (const char *p = MORSE; *p; p++) {
+    if (*p == ' ') { morse[morseN++] = 0; morse[morseN++] = 0; continue; }   // letter gap = 3
+    for (int n = *p == '-' ? 3 : 1; n--;) morse[morseN++] = 1;
+    morse[morseN++] = 0;
+  }
+}
+
+int tick(int s, uint32_t k) {
+  switch (s) {
+    case S_HELLO: {                                       // 8 kHz samples, played twice
+      uint32_t i = k / 2, rep = VOICE_HELLO_N + 2400;       // + 300 ms pause
+      if (i >= 2 * rep) return END;
+      i %= rep;
+      if (i >= VOICE_HELLO_N) return 0;
+      int v = VOICE_HELLO[i / 2] >> (i & 1 ? 4 : 0) & 15;
+      return ((v ^ 8) - 8) * 6;                           // -8..7 -> about +-2.9 kHz
+    }
+    case S_SIREN: {                                       // 600 -> 1400 -> 600 Hz each second, 3 s
+      if (k >= 3 * TICK_HZ) return END;
+      int t = k % TICK_HZ;
+      return sine(600 + (t < 8000 ? t : TICK_HZ - t) / 10);
+    }
+    case S_LASER: {                                       // 3 zaps: 3000 -> 200 Hz in 200 ms
+      if (k >= 3 * 4000) return END;
+      int t = k % 4000;
+      return t < 3200 ? square(3000 - t * 7 / 8) : 0;
+    }
+    case S_ROGER:                                         // 1200 Hz then 1600 Hz, 100 ms each
+      return k < 1600 ? sine(1200) : k < 3200 ? sine(1600) : END;
+    case S_MORSE: {
+      uint32_t u = k / 960;                               // 60 ms units
+      return u >= (uint32_t)morseN ? END : morse[u] ? sine(700) : 0;
+    }
+    case S_TONE: return k < 2 * TICK_HZ ? sine(1000) : END;
+    default:     return k < 2 * TICK_HZ ? 0 : END;        // carrier, 2 s
+  }
+}
+
+// Transmits sound s on the current frequency and power.
 void send(int s) {
-  const int ms = s == SIG_SONG ? songMs() : LENGTHS_MS[lenIdx], dbm = POWERS[powIdx];
-  static const char *const NAMES[NUM_SIG] = {"carrier", "tone 1 kHz", "chiptune"};
-  Serial.printf("TX %d.%03d MHz  %d dBm  %s  %d ms\n", fKHz / 1000, fKHz % 1000, dbm, NAMES[s], ms);
+  const int dbm = POWERS[powIdx];
+  Serial.printf("TX %d.%03d MHz  %d dBm  %s\n", fKHz / 1000, fKHz % 1000, dbm, PADS[s]);
   glowOff();
-  drawButton(true);
-  status("Tap or BOOT to stop", C_DIM);
+  drawPad(s, true);
+  status("Tap or BOOT to stop", C_ALERT);
+  if (!morseN) buildMorse();
   frf0 = (uint64_t)fKHz * 524288 / 32000;                 // f x 2^19 / 32 MHz
   radio.setFrequency(fKHz / 1000.0f);
   radio.setOutputPower(dbm);
@@ -1730,23 +1776,21 @@ void send(int s) {
   armed = false;
   bool stopped = false;
   uint32_t t0 = millis();
-  if (s == SIG_SONG) {
+  if (s == S_SONG) {
     for (auto &st : SONG) {
       uint32_t len = st.len * STEP_MS;
       if (!playNote(st.note, st.arp, len - GAP_MS) || !playNote(0, 0, GAP_MS)) { stopped = true; break; }
     }
   } else {
+    ph = 0;
     uint32_t next = micros();
-    for (int k = 0; millis() - t0 < (uint32_t)ms; k++) {
-      if (s == SIG_TONE) {                                // next sine step, every 62.5 us
-        while ((int32_t)(micros() - next) < 0) {}
-        next += 62 + (k & 1);
-        setFrf(frf0 + SIN16[k & 15]);
-        if (k & 15) continue;                             // buttons once per tone cycle
-      } else {
-        delay(1);
-      }
-      if (stopNow()) { stopped = true; break; }
+    for (uint32_t k = 0;; k++) {
+      int d = tick(s, k);
+      if (d == END) break;
+      while ((int32_t)(micros() - next) < 0) {}
+      next += 62 + (k & 1);                               // 62.5 us
+      setFrf(frf0 + d);
+      if ((k & 255) == 0 && stopNow()) { stopped = true; break; }
     }
   }
   radio.standby();
@@ -1755,9 +1799,9 @@ void send(int s) {
   while (digitalRead(PIN_BOOT) == LOW) delay(10);         // don't let BOOT switch modes
   bootEvent();
   delay(60); pollTouch(); pendingTap.valid = pendingDrag.valid = false;   // the stopping tap
-  drawButton(false);
+  drawPad(s, false);
   char b[40];
-  snprintf(b, sizeof b, stopped ? "Stopped after %lu ms" : "Sent %lu ms", (unsigned long)dt);
+  snprintf(b, sizeof b, stopped ? "%s stopped, %lu ms" : "Sent %s, %lu ms", PADS[s], (unsigned long)dt);
   status(b, C_TEXT);
 }
 
@@ -1765,7 +1809,6 @@ void enter() {
   load();
   radio.beginFSK(fKHz / 1000.0f, 4.8, 5.0, SWEEP_BW_KHZ);
   radio.standby();
-  sel = -1;
   drawAll();
   Serial.printf("TX ready: %d.%03d MHz\n", fKHz / 1000, fKHz % 1000);
 }
@@ -1776,43 +1819,30 @@ void leave() {
   radio.begin(METER_FREQ_MHZ);                            // LoRa again, as METER expects
 }
 
-// The header Menu: quick actions on the current frequency and power.
+// The header Menu: frequency and power (the same as the two buttons on top).
 void menu() {
-  static const char *const L[] = {"Play chiptune", "Send 1 kHz tone", "Send carrier", "Frequency", "Power"};
-  char f[16], p[12], song[12], len[12];
+  static const char *const L[] = {"Frequency", "Power"};
+  char f[16], p[12];
   snprintf(f, sizeof f, "%d.%03d", fKHz / 1000, fKHz % 1000);
   snprintf(p, sizeof p, "%d dBm", POWERS[powIdx]);
-  snprintf(song, sizeof song, "%d s", songMs() / 1000);
-  snprintf(len, sizeof len, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100);
-  const char *V[] = {song, len, len, f, p};
-  int c = uiList("TX menu", L, V, 5, takeTap);
-  sel = -1;
-  if (c == 3) pickFreq();
-  if (c == 4) { powIdx = (powIdx + 1) % 5; save(); }
+  const char *V[] = {f, p};
+  int c = uiList("TX menu", L, V, 2, takeTap);
+  if (c == 0) pickFreq();
+  if (c == 1) { powIdx = (powIdx + 1) % 5; save(); }
   drawAll();
-  if (c >= 0 && c <= 2) send(c == 0 ? SIG_SONG : c == 1 ? SIG_TONE : SIG_CARRIER);
 }
 
 void loop() {
   pendingDrag.valid = false;
   if (!tapped()) return;
-  int y = pendingTap.y;
-  if (y >= TX_Y && y < TX_Y + TX_H) { send(sig); return; }
-  int r = (y - ROW_Y) / ROW_P;
-  if (y < ROW_Y || r > 3 || (y - ROW_Y) % ROW_P >= ROW_H) return;
-  int was = sel;
-  sel = r;
-  switch (r) {
-    case 0: pickFreq(); drawAll(); return;
-    case 1: powIdx = (powIdx + 1) % 5; break;
-    case 2: sig = (sig + 1) % NUM_SIG; break;
-    default: lenIdx = (lenIdx + 1) % 4; break;
+  int x = pendingTap.x, y = pendingTap.y;
+  if (y >= TOP_Y && y < TOP_Y + TOP_H) {
+    if (x < POW_X) { pickFreq(); drawAll(); }
+    else { powIdx = (powIdx + 1) % 5; save(); drawTop(); }
+    return;
   }
-  save();
-  glowOff();
-  if (was >= 0 && was != r) drawRow(was);
-  drawRow(r);
-  if (r == 2) drawRow(3);                                 // Length follows the signal
+  int p = padAt(x, y);
+  if (p >= 0) send(p);
 }
 
 }  // namespace tx
@@ -1855,8 +1885,55 @@ static void rxMenu() {
   else { sweep::setBand(BAND[c - 3][0], BAND[c - 3][1]); enterMode(MODE_SWEEP); }
 }
 
+// ---- serial commands, one per line, so the PC can drive the board in tests:
+//   T<unix ms>      set the clock           status         print the state
+//   tap X Y         a tap at screen X,Y     drag DX Y      a drag of DX px at row Y
+//   stop            stop a transmission     boot           a short BOOT press
+//   mode meter|sweep|scan|tx                send N         TX sound board pad N (0-7)
+// Taps and drags go straight in; screen changes wait for the main loop.
+static int queuedMode = -1, queuedSend = -1;
+static bool queuedBoot;
+
+static void printStatus() {
+  static const char *const M[] = {"meter", "sweep", "scan", "tx"};
+  int a = gKHz(sweep::vStart), b = gKHz(min(GBINS, sweep::vStart + sweep::NPX * sweep::bpp));
+  Serial.printf("STATUS mode %s  sweep %d.%02d-%d.%02d MHz x%d  scan %s %d.%03d  tx %d.%03d MHz %d dBm  "
+                "logged %lu  sd %d  heap %u\n", M[mode], a / 1000, a % 1000 / 10, b / 1000, b % 1000 / 10,
+                sweep::bpp, scan::locked ? "locked" : "scanning", gKHz(scan::lockG) / 1000,
+                gKHz(scan::lockG) % 1000, tx::fKHz / 1000, tx::fKHz % 1000, tx::POWERS[tx::powIdx],
+                (unsigned long)detlog::total, sdOk, (unsigned)ESP.getFreeHeap());
+}
+
+static void serialCommands() {
+  static char line[40];
+  static uint8_t n;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { if (n < sizeof line - 1) line[n++] = c; continue; }
+    line[n] = 0;
+    if (!n) continue;
+    n = 0;
+    int a, b;
+    char w[12];
+    if (line[0] == 'T' && strlen(line) > 10) { detlog::setClock(strtoull(line + 1, nullptr, 10)); continue; }
+    if (sscanf(line, "tap %d %d", &a, &b) == 2) pendingTap = {true, a, b};
+    else if (sscanf(line, "drag %d %d", &a, &b) == 2) pendingDrag = {true, a, b};
+    else if (!strcmp(line, "stop")) pendingTap = {true, 0, 0};
+    else if (!strcmp(line, "boot")) queuedBoot = true;
+    else if (sscanf(line, "send %d", &a) == 1 && a >= 0 && a < tx::NUM_SND) queuedSend = a;
+    else if (sscanf(line, "mode %11s", w) == 1) {
+      static const char *const M[] = {"meter", "sweep", "scan", "tx"};
+      for (int i = 0; i < 4; i++) if (!strcmp(w, M[i])) queuedMode = i;
+      if (queuedMode < 0) { Serial.printf("CMD ? %s\n", line); continue; }
+    } else if (!strcmp(line, "status")) { printStatus(); continue; }
+    else { Serial.printf("CMD ? %s\n", line); continue; }
+    Serial.printf("CMD ok %s\n", line);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+  serialHook = serialCommands;
   delay(300);
   Serial.println("\nH@N 433MHz LoRa Module Scanner");
 
@@ -1913,9 +1990,12 @@ void setup() {
 }
 
 void loop() {
-  detlog::pollSerial();
+  if (Serial.available()) serialCommands();
   detlog::flush();
+  if (queuedMode >= 0) { Mode m = (Mode)queuedMode; queuedMode = -1; switchMode(m); return; }
+  if (queuedSend >= 0) { int s = queuedSend; queuedSend = -1; switchMode(MODE_TX); tx::send(s); return; }
   int boot = bootEvent();
+  if (queuedBoot) { queuedBoot = false; boot = 1; }
   if (boot == 1) {                       // short press: METER -> SWEEP -> SCAN (in RX)
     if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : mode == MODE_SWEEP ? MODE_SCAN : MODE_METER);
     return;
