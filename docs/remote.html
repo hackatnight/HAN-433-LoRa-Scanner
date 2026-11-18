@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H@N 433 Remote</title>
+<meta name="description" content="Bluetooth remote for the H@N 433MHz LoRa Module Scanner: live spectrum and waterfall, controls and log download, from Chrome on Android.">
+<style>
+  :root {
+    --bg: #000000; --panel: #032d63; --hilite: #386bb8; --accent: #7ce8ff;
+    --text: #eef6ff; --dim: #9ec0eb; --warn: #ffd166; --danger: #ff6b8b;
+    --btn-bg: #030612; --btn-border: #2a4880;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 Tahoma, Geneva, Verdana, sans-serif; }
+  header { border-bottom: 1px solid #3a4272; padding: 10px 16px; display: flex; align-items: center; gap: 10px; }
+  header h1 { margin: 0; font-size: 19px; color: var(--accent); flex: 1; }
+  #state { color: var(--dim); font-size: 13px; }
+  main { max-width: 820px; margin: 0 auto; padding: 12px 16px; }
+  .warn { background: #241b05; border: 1px solid var(--warn); color: var(--warn); padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
+  .btn { background: var(--btn-bg); color: var(--text); border: 1px solid var(--btn-border);
+         padding: 9px 12px; font: inherit; cursor: pointer; }
+  .btn.on { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .4; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .row > * { flex: 1 1 auto; }
+  select, input { background: var(--btn-bg); color: var(--text); border: 1px solid var(--btn-border); padding: 9px; font: inherit; min-width: 0; }
+  canvas { display: block; width: 100%; background: #000; border: 1px solid var(--panel); }
+  #axis { display: flex; justify-content: space-between; color: var(--dim); font-size: 12px; margin: 2px 0 6px; }
+  #readout { color: var(--accent); font-size: 13px; min-height: 18px; }
+  #hits { list-style: none; padding: 0; margin: 0; font: 13px monospace; color: var(--text); }
+  #hits li { border-bottom: 1px solid #0b2148; padding: 3px 0; }
+  #con { height: 160px; overflow: auto; background: #020812; border: 1px solid var(--panel);
+         font: 12px monospace; color: var(--dim); padding: 6px; white-space: pre-wrap; margin: 0; }
+  h2 { font-size: 15px; color: var(--accent); margin: 14px 0 4px; }
+  .note { color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>H@N 433 Remote</h1>
+  <span id="state">not connected</span>
+  <button class="btn" id="connect">Connect</button>
+</header>
+<main>
+  <div class="warn"><strong>FOR RESEARCH PURPOSES ONLY.</strong> Receive-only listening. Transmitting needs the right license for the band.</div>
+  <p class="note" id="nosupport" hidden>This browser has no Web Bluetooth. Use Chrome on Android (or desktop Chrome / Edge).</p>
+
+  <canvas id="spec" width="384" height="120"></canvas>
+  <div id="axis"><span id="a0">-</span><span id="a1"></span><span id="a2">-</span></div>
+  <canvas id="wf" width="384" height="200"></canvas>
+  <div id="readout"></div>
+
+  <div class="row">
+    <select id="band">
+      <option value="410000 525000">Full range 410-525</option>
+      <option value="420000 450000">70 cm ham 420-450</option>
+      <option value="430000 440000">430-440</option>
+      <option value="433050 434790">433 ISM</option>
+      <option value="446000 446200">PMR446</option>
+      <option value="450000 470000">UHF business 450-470</option>
+      <option value="462000 467725">FRS / GMRS</option>
+      <option value="488000 498000">488-498 (the 492 signal)</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn" id="scan">Scan</button>
+    <button class="btn" id="speed">Fast</button>
+    <button class="btn" data-cmd="status">Status</button>
+    <button class="btn" id="clear">Clear hold</button>
+  </div>
+  <div class="row">
+    <button class="btn" id="dl">Download log (CSV)</button>
+  </div>
+
+  <h2>TX <span id="txinfo" class="note"></span></h2>
+  <div class="warn">Transmitting on 433 MHz needs an amateur radio license, and a voice transmission must
+    identify with your callsign. Use low power and a dummy load for bench tests.</div>
+  <div class="row" id="pads"></div>
+  <div class="row">
+    <button class="btn" data-cmd="stop">Stop TX</button>
+    <button class="btn" data-cmd="mode scan">Back to scan</button>
+  </div>
+
+  <h2>Speech</h2>
+  <textarea id="say" rows="2" style="width:100%;background:var(--btn-bg);color:var(--text);border:1px solid var(--btn-border);padding:8px;font:inherit"
+    placeholder="Text to speak, up to about 8 seconds"></textarea>
+  <div class="row">
+    <input id="call" placeholder="Callsign (added at the end)" autocapitalize="characters" autocomplete="off">
+  </div>
+  <div class="row">
+    <button class="btn" id="preview">Preview here</button>
+    <button class="btn" id="speak">Transmit speech</button>
+  </div>
+  <div class="note" id="sayinfo"></div>
+
+  <h2>Hits</h2>
+  <ul id="hits"></ul>
+
+  <h2>Console</h2>
+  <pre id="con"></pre>
+  <div class="row">
+    <input id="cmd" placeholder="command, e.g. probe 492500" autocapitalize="off" autocomplete="off">
+    <button class="btn" id="send" style="flex:0 0 auto">Send</button>
+  </div>
+  <p class="note">Same commands as the USB serial port: status, log N, probe KHZ, view LO HI, scan on|off,
+    speed fast|slow, tap X Y, boot, mode tx, send N, say N, stop.</p>
+  <p class="note">Speech by <a href="https://www.masswerk.at/mespeak/">meSpeak</a> (eSpeak, GPL), loaded from jsDelivr on first use.</p>
+</main>
+<script>
+const U = n => `6e40000${n}-b5a3-f393-e0a9-e50e24dcca9e`;
+const $ = id => document.getElementById(id);
+let rxC, dev, txt = '', writes = Promise.resolve();
+let logRows = null, logTimer = 0;
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+if (!navigator.bluetooth) { $('nosupport').hidden = false; $('connect').disabled = true; }
+
+function log(s) {
+  const c = $('con');
+  c.textContent += s + '\n';
+  if (c.textContent.length > 20000) c.textContent = c.textContent.slice(-15000);
+  c.scrollTop = c.scrollHeight;
+}
+function send(s) {                         // one write per line, in order
+  if (!rxC) return;
+  writes = writes.then(() => rxC.writeValueWithoutResponse
+      ? rxC.writeValueWithoutResponse(enc.encode(s + '\n')) : rxC.writeValue(enc.encode(s + '\n')))
+    .catch(e => log('! ' + e.message));
+  log('> ' + s);
+}
+
+// ---- text from the board
+function line(s) {
+  if (logRows && s.startsWith('ROW ')) {
+    logRows.push(s.slice(4));
+    clearTimeout(logTimer); logTimer = setTimeout(saveLog, 1500);
+    return;
+  }
+  log(s);
+  let m;
+  if ((m = s.match(/^STATUS .*scan (on|off)/))) setScan(m[1] === 'on');
+  if ((m = s.match(/^STATUS .*  (fast|slow)  /))) setSpeed(m[1] === 'slow');
+  if ((m = s.match(/^SCAN (on|off)$/))) setScan(m[1] === 'on');
+  if ((m = s.match(/(?:^STATUS .* tx |^TX ready: )(\d+\.\d+ MHz(?: \d+ dBm)?)/))) $('txinfo').textContent = m[1];
+  if (s.startsWith('SCAN lock') || s.startsWith('DET ') || s.includes('steady carrier')) {
+    const li = document.createElement('li');
+    li.textContent = new Date().toLocaleTimeString() + '  ' + s.slice(5);
+    $('hits').prepend(li);
+    while ($('hits').children.length > 30) $('hits').lastChild.remove();
+  }
+}
+function onText(e) {
+  txt += dec.decode(e.target.value);
+  let i;
+  while ((i = txt.indexOf('\n')) >= 0) { line(txt.slice(0, i).replace(/\r$/, '')); txt = txt.slice(i + 1); }
+}
+
+// ---- spectrum rows: u32 start kHz, u16 kHz/pt, u8 first, u8 total, then dBm+160 per point
+const spec = $('spec'), sc = spec.getContext('2d'), wf = $('wf'), wc = wf.getContext('2d');
+let row = [], hold = [], start = 0, step = 0;
+const pal = [];
+for (let i = 0; i < 64; i++) {                 // black - blue - cyan - yellow - red
+  const t = i / 63, k = [[0, 0, 0], [0, 40, 140], [0, 200, 255], [255, 230, 0], [255, 40, 40]];
+  const p = t * 4, j = Math.min(3, Math.floor(p)), f = p - j;
+  pal.push(k[j].map((v, n) => Math.round(v + (k[j + 1][n] - v) * f)));
+}
+function onSpec(e) {
+  const d = e.target.value, s = d.getUint32(0, true), st = d.getUint16(4, true), first = d.getUint8(6), n = d.getUint8(7);
+  if (s !== start || st !== step || row.length !== n) { start = s; step = st; row = new Array(n).fill(-130); hold = row.slice(); axis(); }
+  for (let i = 8; i < d.byteLength; i++) row[first + i - 8] = d.getUint8(i) - 160;
+  if (first + d.byteLength - 8 >= n) draw();
+}
+const mhz = k => (k / 1000).toFixed(k % 1000 ? 2 : 0);
+function axis() {
+  const end = start + step * row.length;
+  $('a0').textContent = mhz(start); $('a1').textContent = mhz((start + end) / 2); $('a2').textContent = mhz(end) + ' MHz';
+}
+const y = (v, h) => h - Math.max(0, Math.min(h, (v + 130) * h / 110));
+function draw() {
+  const n = row.length, W = spec.width, H = spec.height;
+  const sorted = row.slice().sort((a, b) => a - b), floor = sorted[n >> 2];
+  sc.fillStyle = '#000'; sc.fillRect(0, 0, W, H);
+  sc.strokeStyle = '#0b2148';
+  for (let d = -120; d <= -30; d += 30) { sc.beginPath(); sc.moveTo(0, y(d, H)); sc.lineTo(W, y(d, H)); sc.stroke(); }
+  sc.fillStyle = '#9ec0eb'; sc.font = '10px sans-serif';
+  for (let d = -120; d <= -30; d += 30) sc.fillText(d, 2, y(d, H) - 2);
+  let best = 0;
+  for (let i = 0; i < n; i++) { if (row[i] > hold[i]) hold[i] = row[i]; if (row[i] > row[best]) best = i; }
+  const bw = W / n;
+  sc.fillStyle = '#386bb8';
+  for (let i = 0; i < n; i++) sc.fillRect(i * bw, y(hold[i], H), Math.max(1, bw), 1);
+  sc.fillStyle = '#7ce8ff';
+  for (let i = 0; i < n; i++) { const t = y(row[i], H); sc.fillRect(i * bw, t, Math.max(1, bw - .3), H - t); }
+  // waterfall: shift down a row, new row on top
+  wc.drawImage(wf, 0, 0, wf.width, wf.height - 2, 0, 2, wf.width, wf.height - 2);
+  const img = wc.createImageData(wf.width, 2);
+  for (let x = 0; x < wf.width; x++) {
+    const v = row[Math.floor(x * n / wf.width)], k = Math.max(0, Math.min(63, Math.round((v - floor) * 63 / 40)));
+    for (let r = 0; r < 2; r++) { const o = (r * wf.width + x) * 4; img.data.set(pal[k], o); img.data[o + 3] = 255; }
+  }
+  wc.putImageData(img, 0, 0);
+  $('readout').textContent = `peak ${mhz(start + step * best + step / 2)} MHz  ${row[best]} dBm   floor ${floor} dBm`;
+}
+$('clear').onclick = () => { hold = row.slice(); };
+
+// ---- controls
+let scanOn = false, slow = false;
+function setScan(v) { scanOn = v; $('scan').classList.toggle('on', v); $('scan').textContent = v ? 'Scan on' : 'Scan off'; }
+function setSpeed(v) { slow = v; $('speed').textContent = v ? 'Slow' : 'Fast'; }
+$('scan').onclick = () => send(scanOn ? 'scan off' : 'scan on');
+$('speed').onclick = () => { send(slow ? 'speed fast' : 'speed slow'); setSpeed(!slow); };
+$('band').onchange = () => send('view ' + $('band').value);
+['Hello', 'Chiptune', 'Siren', 'Laser', 'Roger', 'Morse H@N', 'Tone', 'Carrier'].forEach((n, i) => {
+  const b = document.createElement('button');
+  b.className = 'btn'; b.textContent = n; b.dataset.cmd = 'send ' + i; b.style.flex = '1 1 22%';
+  $('pads').append(b);
+});
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = () => send(b.dataset.cmd));
+
+// ---- speech: meSpeak (eSpeak) -> 8 kHz -> 4-bit, uploaded to AUDIO, then "say N"
+const MS = 'https://cdn.jsdelivr.net/npm/mespeak@1.9.6/';
+let msReady, audC;
+function loadSpeech() {
+  return msReady = msReady || new Promise((ok, bad) => {
+    $('sayinfo').textContent = 'Loading the speech engine (about 3 MB, once)...';
+    const s = document.createElement('script');
+    s.src = MS + 'mespeak.js';
+    s.onerror = () => { msReady = null; bad(new Error('could not load meSpeak')); };
+    s.onload = () => {
+      meSpeak.loadConfig(MS + 'mespeak_config.json');
+      meSpeak.loadVoice(MS + 'voices/en/en-us.json');
+      const t0 = Date.now();
+      (function wait() {
+        if (meSpeak.isConfigLoaded() && meSpeak.isVoiceLoaded('en/en-us')) return ok();
+        if (Date.now() - t0 > 30000) { msReady = null; return bad(new Error('speech engine timed out')); }
+        setTimeout(wait, 100);
+      })();
+    };
+    document.head.append(s);
+  });
+}
+async function makeSpeech() {
+  await loadSpeech();
+  let text = $('say').value.trim();
+  const call = $('call').value.trim().toUpperCase();
+  if (call) text += (text ? '. ' : '') + 'This is ' + call.split('').join(' ') + '.';
+  if (!text) throw new Error('type something to say');
+  const wav = new Uint8Array(meSpeak.speak(text, { rawdata: 'array', speed: 155, pitch: 45 }));
+  const d = new DataView(wav.buffer), sr = d.getUint32(24, true);
+  let p = 12, data = 0, len = 0;
+  while (p + 8 <= wav.length) {                  // find the "data" chunk
+    const id = String.fromCharCode(...wav.slice(p, p + 4)), sz = d.getUint32(p + 4, true);
+    if (id === 'data') { data = p + 8; len = Math.min(sz, wav.length - data) >> 1; break; }
+    p += 8 + sz;
+  }
+  if (!len) throw new Error('no audio from meSpeak');
+  // resample to 8 kHz with a 300-3400 Hz voice band (OfflineAudioContext does the filtering)
+  const n = Math.min(65536, Math.floor(len * 8000 / sr));
+  const oc = new OfflineAudioContext(1, n, 8000), src = oc.createBufferSource();
+  const ib = oc.createBuffer(1, len, sr), ch = ib.getChannelData(0);
+  for (let i = 0; i < len; i++) ch[i] = d.getInt16(data + 2 * i, true) / 32768;
+  src.buffer = ib;
+  const hp = oc.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 300;
+  const lp = oc.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3400;
+  src.connect(hp).connect(lp).connect(oc.destination);
+  src.start();
+  const x = (await oc.startRendering()).getChannelData(0);
+  let pk = 1e-6;
+  for (const v of x) pk = Math.max(pk, Math.abs(v));
+  const bytes = new Uint8Array((n + 1) >> 1), q = new Float32Array(n), K = 2.5, T = Math.tanh(K);
+  for (let i = 0; i < n; i++) {                  // normalize, a little soft clipping for loudness, 4 bits
+    const s = Math.max(-8, Math.min(7, Math.round(Math.tanh(K * x[i] / pk) / T * 7.5)));
+    q[i] = s / 8;
+    bytes[i >> 1] |= (s & 15) << (i & 1 ? 4 : 0);
+  }
+  $('sayinfo').textContent = `${(n / 8000).toFixed(1)} s, ${bytes.length} bytes` + (n === 65536 ? ' (cut at 8 s)' : '');
+  return { bytes, n, q };
+}
+$('preview').onclick = async () => {
+  try {
+    const { n, q } = await makeSpeech(), ac = new AudioContext(), b = ac.createBuffer(1, n, 8000);
+    b.copyToChannel(q, 0);
+    const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start();
+  } catch (e) { $('sayinfo').textContent = e.message; }
+};
+$('speak').onclick = async () => {
+  if (!audC) { $('sayinfo').textContent = 'Connect first (and flash the firmware with speech).'; return; }
+  try {
+    const { bytes, n } = await makeSpeech();
+    $('speak').disabled = true;
+    for (let o = 0; o < bytes.length; o += 180) {
+      const c = bytes.subarray(o, o + 180), pkt = new Uint8Array(4 + c.length);
+      new DataView(pkt.buffer).setUint32(0, o, true);
+      pkt.set(c, 4);
+      await (writes = writes.then(() => audC.writeValueWithoutResponse(pkt)));
+      $('sayinfo').textContent = `Uploading ${Math.round(100 * (o + c.length) / bytes.length)}%`;
+    }
+    send('say ' + n);
+    $('sayinfo').textContent = `Sent ${(n / 8000).toFixed(1)} s of speech`;
+  } catch (e) { $('sayinfo').textContent = e.message; }
+  $('speak').disabled = false;
+};
+$('send').onclick = () => { const v = $('cmd').value.trim(); if (v) send(v); $('cmd').value = ''; };
+$('cmd').onkeydown = e => { if (e.key === 'Enter') $('send').onclick(); };
+
+$('dl').onclick = () => {
+  logRows = []; $('dl').disabled = true; $('dl').textContent = 'Reading log...';
+  send('log 100000');
+  logTimer = setTimeout(saveLog, 8000);
+};
+function saveLog() {
+  const rows = logRows || []; logRows = null;
+  $('dl').disabled = false; $('dl').textContent = 'Download log (CSV)';
+  const body = rows.filter(r => !r.startsWith('/') && !r.startsWith('no '));
+  log(`log: ${body.length} rows`);
+  if (!body.length) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([body.join('\n') + '\n'], { type: 'text/csv' }));
+  a.download = 'han433_log_' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.csv';
+  a.click();
+}
+
+// ---- connect
+$('connect').onclick = async () => {
+  if (dev && dev.gatt.connected) { dev.gatt.disconnect(); return; }
+  try {
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [U(1)] }] });
+    dev.addEventListener('gattserverdisconnected', () => {
+      rxC = audC = null; $('state').textContent = 'disconnected'; $('connect').textContent = 'Connect';
+    });
+    $('state').textContent = 'connecting...';
+    const svc = await (await dev.gatt.connect()).getPrimaryService(U(1));
+    rxC = await svc.getCharacteristic(U(2));
+    const tx = await svc.getCharacteristic(U(3)), sp = await svc.getCharacteristic(U(4));
+    audC = await svc.getCharacteristic(U(5)).catch(() => null);   // older firmware: no speech
+    tx.addEventListener('characteristicvaluechanged', onText);
+    sp.addEventListener('characteristicvaluechanged', onSpec);
+    await tx.startNotifications();
+    await sp.startNotifications();
+    $('state').textContent = 'connected'; $('connect').textContent = 'Disconnect';
+    send('T' + Date.now());                // the board has no clock of its own
+    send('status');
+  } catch (e) { $('state').textContent = 'not connected'; log('! ' + e.message); }
+};
+</script>
+</body>
+</html>

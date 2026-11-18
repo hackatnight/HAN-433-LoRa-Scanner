@@ -38,7 +38,7 @@ jobs:
         run: |
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.17
-          arduino-cli lib install RadioLib@7.8.1 LovyanGFX@1.1.16
+          arduino-cli lib install RadioLib@7.8.1 LovyanGFX@1.1.16 NimBLE-Arduino@1.4.3
           pip install esptool
 
       - name: Build and merge into one flashable image

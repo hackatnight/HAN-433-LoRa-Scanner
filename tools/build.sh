@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the scanner with arduino-cli and merge it into one .bin that flashes at 0x0
 # (bootloader + partition table + boot_app0 + app). Same toolchain as H@N-CYD-GBC:
-#   arduino-cli, core esp32:esp32 2.0.17, LovyanGFX 1.1.16, plus RadioLib 7.8.1
+#   arduino-cli, core esp32:esp32 2.0.17, LovyanGFX 1.1.16, plus RadioLib 7.8.1 and NimBLE-Arduino 1.4.3
 #
 #   tools/build.sh              build docs/firmware/HAN-433-Scanner.bin
 #   tools/build.sh flash COM4   build, then write that same image to a board

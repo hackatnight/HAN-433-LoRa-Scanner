@@ -149,6 +149,7 @@ static const int SCR_W = 240, SCR_H = 320;
 static const int P_W = 240, P_H = 320;   // the panel in portrait (rotation 2)
 #include "han_ui.h"
 #include "voice_hello.h"
+#include "han_ble.h"
 static uint16_t C_GRID, C_ALERT;   // on top of the theme colors (han_ui.h)
 
 // ---------------------------------------------------------------- shared helpers
@@ -283,7 +284,7 @@ static const char *saveCal() {
     File f = SD.open(CAL_FILE, FILE_WRITE);
     if (f) { f.println(line); f.close(); saved = true; }
   }
-  Serial.printf("Touch calibration saved (%s): %s\n",
+  con.printf("Touch calibration saved (%s): %s\n",
                 saved ? "SD card + flash" : "flash only, no SD card", line.c_str());
   return saved ? "SD card" : "flash (no SD card found)";
 }
@@ -350,7 +351,7 @@ static void touchDiag() {
   static uint32_t lastBytes = 0;
   if (millis() - lastBytes > 2000 || pen) {
     lastBytes = millis();
-    Serial.printf("CAL bytes %02X %02X %02X %02X %02X %02X %02X %02X\n",
+    con.printf("CAL bytes %02X %02X %02X %02X %02X %02X %02X %02X\n",
                   d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
   }
   lcd.setFont(&fonts::Font2);
@@ -360,7 +361,7 @@ static void touchDiag() {
   lcd.drawString(buf, P_W / 2, 230);
   lcd.setTextPadding(0);
   static uint32_t lastPrint = 0;
-  if (pen || got || millis() - lastPrint > 2000) { lastPrint = millis(); Serial.printf("CAL %s\n", buf); }
+  if (pen || got || millis() - lastPrint > 2000) { lastPrint = millis(); con.printf("CAL %s\n", buf); }
 }
 
 static void drawCross(int x, int y, uint16_t c) {
@@ -422,7 +423,7 @@ static bool calSolve(const float rx[4], const float ry[4], const float PX[4], co
     float ex = ax * U[i] + bx - PX[i], ey = ay * V[i] + by - PY[i];
     if (ex * ex + ey * ey > 20 * 20) ok = false;
   }
-  Serial.printf("CAL solve: swap %d  x = %.4f*u + %.1f  y = %.4f*v + %.1f  fit %.3f/%.3f  %s\n",
+  con.printf("CAL solve: swap %d  x = %.4f*u + %.1f  y = %.4f*v + %.1f  fit %.3f/%.3f  %s\n",
                 swap, ax, bx, ay, by, c1, c2, ok ? "OK" : "REJECTED");
   if (ok) cal = {true, swap, ax, bx, ay, by};
   return ok;
@@ -437,7 +438,7 @@ static bool calibrateTouch() {
   const int TX[4] = { 30, P_W - 30, 30, P_W - 30 };
   const int TY[4] = { 50, 50, SCR_H - 30, SCR_H - 30 };
   float rx[4], ry[4];
-  Serial.println("Touch calibration started");
+  con.println("Touch calibration started");
   lcd.fillScreen(C_BG);
   lcd.setFont(&fonts::Font2);
   lcd.setTextColor(C_TEXT, C_BG);
@@ -448,8 +449,8 @@ static bool calibrateTouch() {
   lcd.drawString("(BOOT button = skip)", P_W / 2, SCR_H / 2 + 25);
   for (int i = 0; i < 4; i++) {
     drawCross(TX[i], TY[i], C_ACCENT);
-    if (!sampleRaw(rx[i], ry[i])) { Serial.println("Touch calibration skipped"); return false; }
-    Serial.printf("CAL point %d: raw %.0f, %.0f\n", i + 1, rx[i], ry[i]);
+    if (!sampleRaw(rx[i], ry[i])) { con.println("Touch calibration skipped"); return false; }
+    con.printf("CAL point %d: raw %.0f, %.0f\n", i + 1, rx[i], ry[i]);
     drawCross(TX[i], TY[i], C_BG);
     lcd.fillCircle(TX[i], TY[i], 5, lcd.color565(60, 220, 90));
   }
@@ -508,7 +509,7 @@ static const int DRAG_PX = 15;
 static void (*serialHook)() = nullptr;
 
 static void pollTouch() {
-  if (serialHook && Serial.available()) serialHook();
+  if (serialHook && (Serial.available() || ble::pending())) serialHook();
   static bool down = false;
   static int x0, y0, x1;
   static uint32_t last = 0;
@@ -519,10 +520,10 @@ static void pollTouch() {
   if (now) {
     int sx = -1, sy = -1;
     rawToScreen(rx, ry, sx, sy);   // stays -1,-1 when uncalibrated (never a tab)
-    if (!down) { x0 = x1 = sx; y0 = sy; Serial.printf("TOUCH raw %d,%d -> screen %d,%d\n", rx, ry, sx, sy); }
+    if (!down) { x0 = x1 = sx; y0 = sy; con.printf("TOUCH raw %d,%d -> screen %d,%d\n", rx, ry, sx, sy); }
     else x1 = sx;
   } else if (down) {
-    if (abs(x1 - x0) > DRAG_PX) { pendingDrag = {true, x1 - x0, y0}; Serial.printf("TOUCH drag %d\n", x1 - x0); }
+    if (abs(x1 - x0) > DRAG_PX) { pendingDrag = {true, x1 - x0, y0}; con.printf("TOUCH drag %d\n", x1 - x0); }
     else pendingTap = {true, x0, y0};
   }
   down = now;
@@ -709,7 +710,7 @@ void enter() {
   lastSample = lastFrame = lastSerial = millis();
 
   drawStatic();
-  Serial.printf("METER on %.3f MHz\n", METER_FREQ_MHZ);
+  con.printf("METER on %.3f MHz\n", METER_FREQ_MHZ);
 }
 
 void leave() {
@@ -742,7 +743,7 @@ void loop() {
 
     if (ms - lastSerial >= SERIAL_MS) {
       lastSerial = ms;
-      Serial.printf("RSSI: %.1f dBm\n", now);
+      con.printf("RSSI: %.1f dBm\n", now);
     }
   }
 }
@@ -890,13 +891,13 @@ void setClock(uint64_t unixMs) {
   utcOffMs = (int64_t)unixMs - millis();
   char s[28];
   utc(s, millis());
-  Serial.printf("TIME set %s\n", s);
+  con.printf("TIME set %s\n", s);
 }
 
 void emit(const Det &d) {
   if (!d.hits) return;
   int khz = gKHz(d.bin);
-  Serial.printf("DET %s %d.%03d MHz  %d dBm  +%d dB  %lu ms  %u hits\n", d.src ? "SCAN" : "SWEEP",
+  con.printf("DET %s %d.%03d MHz  %d dBm  +%d dB  %lu ms  %u hits\n", d.src ? "SCAN" : "SWEEP",
                 khz / 1000, khz % 1000, d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.hits);
   total++;
   memmove(recent + 1, recent, sizeof(Det) * (NRECENT - 1));   // newest first
@@ -994,7 +995,7 @@ void loadSpurs() {
   int n = 0;
   for (int i = 0; i < GBINS; i++)
     if (spurMap[i >> 3] & 1 << (i & 7)) { busy[i] = SPUR_BUSY * 2; n++; }
-  Serial.printf("LOG %d spur bins loaded from SD card\n", n);
+  con.printf("LOG %d spur bins loaded from SD card\n", n);
 }
 
 // Main loop, between sweeps: hands the bus to the card, appends the waiting rows and/or
@@ -1009,7 +1010,7 @@ void flush(bool now = false) {
     File s = SD.open(SPUR_FILE, FILE_WRITE);
     bool ok = s;
     if (ok) { s.write(spurMap, sizeof spurMap); s.close(); }
-    Serial.printf("LOG spur map %s\n", ok ? "saved to SD card" : "save FAILED");
+    con.printf("LOG spur map %s\n", ok ? "saved to SD card" : "save FAILED");
     spurDirty = false;
     spurSaved = millis();
   }
@@ -1030,24 +1031,24 @@ void flush(bool now = false) {
     f.close();
   } else dropped += nBuf;
   sdBus(false);
-  Serial.printf("LOG %s %d rows in %lu ms (%lu logged, %lu dropped)\n", ok ? "wrote" : "FAILED",
+  con.printf("LOG %s %d rows in %lu ms (%lu logged, %lu dropped)\n", ok ? "wrote" : "FAILED",
                 nBuf, (unsigned long)(millis() - t), (unsigned long)total, (unsigned long)dropped);
   nBuf = 0;
 }
 
 // The last n rows of the log file, to serial as "ROW ..." (the "log" serial command).
 void tail(int n) {
-  if (!sdOk) { Serial.println("ROW no SD card"); return; }
+  if (!sdOk) { con.println("ROW no SD card"); return; }
   sdBus(true);
   File f = SD.open(FILE_NAME, FILE_READ);
   if (f) {
     uint32_t sz = f.size(), at = sz > (uint32_t)n * 90 ? sz - n * 90 : 0;
     f.seek(at);
     if (at) f.readStringUntil('\n');             // a partial line
-    Serial.printf("ROW %s, %lu bytes\n", FILE_NAME, (unsigned long)sz);
-    while (f.available()) Serial.printf("ROW %s\n", f.readStringUntil('\n').c_str());
+    con.printf("ROW %s, %lu bytes\n", FILE_NAME, (unsigned long)sz);
+    while (f.available()) con.printf("ROW %s\n", f.readStringUntil('\n').c_str());
     f.close();
-  } else Serial.println("ROW no log file");
+  } else con.println("ROW no log file");
   sdBus(false);
 }
 
@@ -1190,7 +1191,7 @@ void setView(int start, int zoom) {
   drawAxis();
   drawButtons();
   int a = gKHz(vStart), b = gKHz(vStart + npx() * bpp);
-  Serial.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
+  con.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
                 b / 1000, b % 1000 / 10, bpp * G_STEP);
 }
 // A band from the menu: the closest zoom that holds it, centered.
@@ -1312,7 +1313,7 @@ void loop() {
   lcd.setTextPadding(0);
 
   if (++sweepCount % 10 == 0)
-    Serial.printf("SWEEP %lu ms  floor %d  top %d dBm  hot %d  spurs %d  peak %s\n",
+    con.printf("SWEEP %lu ms  floor %d  top %d dBm  hot %d  spurs %d  peak %s\n",
                   (unsigned long)dt, floorDbm, top, detlog::hot, detlog::spurs, b + 5);
 }
 
@@ -1518,7 +1519,7 @@ void enter() {
   rf::startRx(rf::BW_250);
   drawStatic();
   startScan();
-  Serial.println("SCAN 410.00-524.95 MHz");
+  con.println("SCAN 410.00-524.95 MHz");
 }
 
 void leave() {
@@ -1565,7 +1566,7 @@ void sweepOnce() {
     tStart = tLast = tShown = millis();
     hits = wins = 1;
     int khz = gKHz(lockG);
-    Serial.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
+    con.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
     bigFreq(khz, C_TEXT);
     status("LOCKED   tap to skip", C_ALERT);
   }
@@ -1600,7 +1601,7 @@ void listen() {
     // Heard in nearly every window for STEADY_MS: a steady carrier, not traffic. Mark the
     // bin a spur (as if it had been busy for a long time); it fades if the carrier goes.
     int khz = gKHz(lockG);
-    Serial.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
+    con.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
     for (int g = max(0, lockG - 1); g <= min(GBINS - 1, lockG + 1); g++) {
       detlog::busy[g] = 65535;
       detlog::spurMap[g >> 3] |= 1 << (g & 7);
@@ -1612,7 +1613,7 @@ void listen() {
 
 void loop() {
   if (tapped()) {                                // tap while locked: skip this one
-    if (locked) { Serial.println("SCAN skip"); endLock(true); }
+    if (locked) { con.println("SCAN skip"); endLock(true); }
     return;
   }
   pendingDrag.valid = false;
@@ -1819,7 +1820,7 @@ void listen() {
   if (now - tLast > scan::HANG_MS) endLock(false);
   else if (on > scan::STEADY_MS && hits >= wins * 95 / 100) {
     int khz = gKHz(lockG);
-    Serial.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
+    con.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
     for (int g = max(0, lockG - 1); g <= min(GBINS - 1, lockG + 1); g++) {
       detlog::busy[g] = 65535;
       detlog::spurMap[g >> 3] |= 1 << (g & 7);
@@ -1843,13 +1844,13 @@ void setView(int start, int zoom) {
   drawAxis();
   drawBar();
   int a = gKHz(vStart), b = gKHz(min(GBINS, vStart + npx() * bpp));
-  Serial.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
+  con.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
                 b / 1000, b % 1000 / 10, bpp * G_STEP);
 }
 void setScan(bool on) {
   if (locked) endLock(false);
   scanOn = on;
-  Serial.printf("SCAN %s\n", on ? "on" : "off");
+  con.printf("SCAN %s\n", on ? "on" : "off");
   drawBar();
   panelIdle();
 }
@@ -1867,7 +1868,15 @@ void drawAll() {
   panelIdle();
   setView(vStart, bpp);
 }
-// Band presets: the closest zoom that holds the band, centered (setView clamps).
+// The closest zoom that holds lo..hi kHz, centered (setView clamps). No redraw.
+void fit(int lo, int hi) {
+  int z = ZOOMS[NZOOM - 1];
+  for (int i = 0; i < NZOOM; i++)
+    if (NPX * ZOOMS[i] * G_STEP >= hi - lo) { z = ZOOMS[i]; break; }
+  bpp = z;
+  vStart = ((lo + hi) / 2 - G0_KHZ) / G_STEP - NPX * z / 2;
+}
+// Band presets.
 void bandMenu() {
   static const char *const L[] = {"Full range", "70 cm ham", "430 - 440", "433 ISM", "PMR446",
                                   "UHF business", "FRS / GMRS"};
@@ -1877,13 +1886,7 @@ void bandMenu() {
                                 {446000, 446200}, {450000, 470000}, {462000, 467725}};
   if (locked) endLock(false);
   int c = uiList("Band", L, V, 7, takeTap);
-  if (c >= 0) {
-    int z = ZOOMS[NZOOM - 1];
-    for (int i = 0; i < NZOOM; i++)
-      if (NPX * ZOOMS[i] * G_STEP >= BAND[c][1] - BAND[c][0]) { z = ZOOMS[i]; break; }
-    bpp = z;
-    vStart = ((BAND[c][0] + BAND[c][1]) / 2 - G0_KHZ) / G_STEP - NPX * z / 2;
-  }
+  if (c >= 0) fit(BAND[c][0], BAND[c][1]);
   drawAll();
 }
 void button(int i) {
@@ -1951,6 +1954,7 @@ void sweepRow() {
     row[x] = sweep::pal[k < 0 ? 0 : k > 63 ? 63 : k];
   }
   pushWaterfall();
+  ble::spectrum(gKHz(vStart), bpp * G_STEP, px, nx);
 
   if (!scanOn) {                                 // sweep only: logs the way SWEEP does
     detlog::scan(mv, mg, n, floorDbm, top, t0);
@@ -1969,7 +1973,7 @@ void sweepRow() {
   tStart = tLast = millis();
   hits = wins = 1;
   int khz = gKHz(lockG);
-  Serial.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
+  con.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
   panelFreq(khz, C_TEXT);
   panelStatus("LOCKED", C_ALERT);
   // A red line through spectrum and waterfall at the locked frequency (any zoom). The
@@ -1993,7 +1997,7 @@ void loop() {
     if (y >= BAR_Y - 4) {
       for (int i = 0; i < 7; i++) if (x >= BX[i] - 1 && x < BX[i] + BWD[i] + 1) button(i);
     } else if (x >= PX0 - 3) {
-      if (locked) { Serial.println("SCAN skip"); endLock(true); }
+      if (locked) { con.println("SCAN skip"); endLock(true); }
     } else if (y >= SPEC_Y && y < SPEC_Y + SPEC_H) {
       for (int i = 0; i < NPX; i++) hold[i] = px[i];
     }
@@ -2018,10 +2022,13 @@ namespace tx {
 
 const int POWERS[] = {2, 5, 10, 14, 17};          // dBm out of PA_BOOST
 const int F_MIN = 430000, F_MAX = 439995;         // kHz
-enum { S_HELLO, S_SONG, S_SIREN, S_LASER, S_ROGER, S_MORSE, S_TONE, S_CARRIER, NUM_SND };
+enum { S_HELLO, S_SONG, S_SIREN, S_LASER, S_ROGER, S_MORSE, S_TONE, S_CARRIER, NUM_SND,
+       S_SPEECH = NUM_SND };                        // speech from the phone (ble::speech): no pad
 const char *const PADS[NUM_SND] = {"Hello", "Chiptune", "Siren", "Laser", "Roger beep", "Morse H@N",
                                    "Tone 1 kHz", "Carrier"};
 int fKHz = 433500, powIdx = 0;
+uint32_t speechN;                                 // samples in ble::speech to send
+const char *name(int s) { return s < NUM_SND ? PADS[s] : "Speech"; }
 
 // 3 kHz deviation in FRF steps (32 MHz / 2^19 = 61.035 Hz): 49 x sin(k x 22.5 deg)
 const int8_t SIN16[16] = {0, 19, 35, 45, 49, 45, 35, 19, 0, -19, -35, -45, -49, -45, -35, -19};
@@ -2150,7 +2157,7 @@ inline void setFrf(uint32_t f) {
 // Stop on BOOT, or on a new touch (the finger that started it must lift first).
 bool armed;
 bool stopNow() {
-  if (serialHook && Serial.available()) serialHook();     // "tap" or "stop" from the PC
+  if (serialHook && (Serial.available() || ble::pending())) serialHook();     // "tap" or "stop" from the PC
   if (pendingTap.valid) return true;
   bool pen = digitalRead(PIN_TP_IRQ) == LOW;
   if (!pen) armed = true;
@@ -2222,6 +2229,12 @@ int tick(int s, uint32_t k) {
       return u >= (uint32_t)morseN ? END : morse[u] ? sine(700) : 0;
     }
     case S_TONE: return k < 2 * TICK_HZ ? sine(1000) : END;
+    case S_SPEECH: {                                      // 8 kHz samples from the phone, once
+      uint32_t i = k / 2;
+      if (i >= speechN) return END;
+      int v = ble::speech[i / 2] >> (i & 1 ? 4 : 0) & 15;
+      return ((v ^ 8) - 8) * 6;
+    }
     default:     return k < 2 * TICK_HZ ? 0 : END;        // carrier, 2 s
   }
 }
@@ -2229,9 +2242,9 @@ int tick(int s, uint32_t k) {
 // Transmits sound s on the current frequency and power.
 void send(int s) {
   const int dbm = POWERS[powIdx];
-  Serial.printf("TX %d.%03d MHz  %d dBm  %s\n", fKHz / 1000, fKHz % 1000, dbm, PADS[s]);
+  con.printf("TX %d.%03d MHz  %d dBm  %s\n", fKHz / 1000, fKHz % 1000, dbm, name(s));
   glowOff();
-  drawPad(s, true);
+  if (s < NUM_SND) drawPad(s, true);
   status("Tap or BOOT to stop", C_ALERT);
   if (!morseN) buildMorse();
   frf0 = (uint64_t)fKHz * 524288 / 32000;                 // f x 2^19 / 32 MHz
@@ -2264,13 +2277,13 @@ void send(int s) {
   }
   radio.standby();
   uint32_t dt = millis() - t0;
-  Serial.printf("TX done after %lu ms%s\n", (unsigned long)dt, stopped ? " (stopped)" : "");
+  con.printf("TX done after %lu ms%s\n", (unsigned long)dt, stopped ? " (stopped)" : "");
   while (digitalRead(PIN_BOOT) == LOW) delay(10);         // don't let BOOT switch modes
   bootEvent();
   delay(60); pollTouch(); pendingTap.valid = pendingDrag.valid = false;   // the stopping tap
-  drawPad(s, false);
+  if (s < NUM_SND) drawPad(s, false);
   char b[40];
-  snprintf(b, sizeof b, stopped ? "%s stopped, %lu ms" : "Sent %s, %lu ms", PADS[s], (unsigned long)dt);
+  snprintf(b, sizeof b, stopped ? "%s stopped, %lu ms" : "Sent %s, %lu ms", name(s), (unsigned long)dt);
   status(b, C_TEXT);
 }
 
@@ -2279,7 +2292,7 @@ void enter() {
   radio.beginFSK(fKHz / 1000.0f, 4.8, 5.0, SWEEP_BW_KHZ);
   radio.standby();
   drawAll();
-  Serial.printf("TX ready: %d.%03d MHz\n", fKHz / 1000, fKHz % 1000);
+  con.printf("TX ready: %d.%03d MHz\n", fKHz / 1000, fKHz % 1000);
 }
 
 void leave() {
@@ -2381,30 +2394,34 @@ static void rxMenu() {
 //   T<unix ms>      set the clock           status         print the state
 //   tap X Y         a tap at screen X,Y     drag DX Y      a drag of DX px at row Y
 //   stop            stop a transmission     boot           a short BOOT press
-//   log             last rows of the SD log, as "ROW ..."
+//   log [N]         last 10 (or N) rows of the SD log, as "ROW ..."
+//   view LO HI      landscape: show LO..HI kHz      scan on|off    speed fast|slow
 //   probe KHZ       fine RSSI profile around KHZ (410000-525000), as "PROBE ..."
 //   mode meter|sweep|scan|tx                send N         TX sound board pad N (0-7)
+//   say N           send N samples of speech the BLE page wrote to ble::speech
 // Taps and drags go straight in; screen changes wait for the main loop.
 static int queuedMode = -1, queuedSend = -1, queuedProbe;
 
 // "probe F": RSSI every 12.5 kHz over F +-150 kHz (62.5 kHz receiver, best of 8 reads
 // each), as one "PROBE" line, 40 times (~3 s). Then the screen it was on starts again.
 static void probe(int khz);
-static bool queuedBoot, queuedLog;
+static bool queuedBoot;
+static int queuedLo, queuedHi, queuedScan = -1, queuedSlow = -1;   // landscape: view, scan, speed
+static int queuedLog;                 // "log" = last 10 rows, "log N" = last N
 
 static void printStatus() {
   static const char *const M[] = {"meter", "sweep", "scan", "tx"};
 #ifdef HAN_LANDSCAPE
   int a = gKHz(land::vStart), b = gKHz(min(GBINS, land::vStart + land::NPX * land::bpp));
   int lg = max(0, land::lockG);
-  Serial.printf("STATUS landscape %s  view %d.%02d-%d.%02d MHz x%d  scan %s%s %d.%03d  %s  tx %d.%03d MHz %d dBm  "
+  con.printf("STATUS landscape %s  view %d.%02d-%d.%02d MHz x%d  scan %s%s %d.%03d  %s  tx %d.%03d MHz %d dBm  "
                 "logged %lu  sd %d  heap %u\n", mode == MODE_TX ? "tx" : "main", a / 1000, a % 1000 / 10,
                 b / 1000, b % 1000 / 10, land::bpp, land::scanOn ? "on" : "off", land::locked ? " locked" : "",
                 gKHz(lg) / 1000, gKHz(lg) % 1000, land::slow ? "slow" : "fast", tx::fKHz / 1000, tx::fKHz % 1000,
                 tx::POWERS[tx::powIdx], (unsigned long)detlog::total, sdOk, (unsigned)ESP.getFreeHeap());
 #else
   int a = gKHz(sweep::vStart), b = gKHz(min(GBINS, sweep::vStart + sweep::NPX * sweep::bpp));
-  Serial.printf("STATUS mode %s  sweep %d.%02d-%d.%02d MHz x%d  scan %s %d.%03d  tx %d.%03d MHz %d dBm  "
+  con.printf("STATUS mode %s  sweep %d.%02d-%d.%02d MHz x%d  scan %s %d.%03d  tx %d.%03d MHz %d dBm  "
                 "logged %lu  sd %d  heap %u\n", M[mode], a / 1000, a % 1000 / 10, b / 1000, b % 1000 / 10,
                 sweep::bpp, scan::locked ? "locked" : "scanning", gKHz(scan::lockG) / 1000,
                 gKHz(scan::lockG) % 1000, tx::fKHz / 1000, tx::fKHz % 1000, tx::POWERS[tx::powIdx],
@@ -2412,12 +2429,15 @@ static void printStatus() {
 #endif
 }
 
+// Lines come from serial and from BLE (ble::read), each with its own buffer.
 static void serialCommands() {
-  static char line[40];
-  static uint8_t n;
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c != '\n' && c != '\r') { if (n < sizeof line - 1) line[n++] = c; continue; }
+  static char lines[2][40];
+  static uint8_t lens[2];
+  for (int src = 0, c; src < 2; src++)
+  while ((c = src ? ble::read() : Serial.available() ? Serial.read() : -1) >= 0) {
+    char *line = lines[src];
+    uint8_t &n = lens[src];
+    if (c != '\n' && c != '\r') { if (n < sizeof lines[0] - 1) line[n++] = c; continue; }
     line[n] = 0;
     if (!n) continue;
     n = 0;
@@ -2428,16 +2448,21 @@ static void serialCommands() {
     else if (sscanf(line, "drag %d %d", &a, &b) == 2) pendingDrag = {true, a, b};
     else if (!strcmp(line, "stop")) pendingTap = {true, 0, 0};
     else if (!strcmp(line, "boot")) queuedBoot = true;
-    else if (!strcmp(line, "log")) queuedLog = true;
+    else if (sscanf(line, "view %d %d", &a, &b) == 2 && a >= 410000 && b <= 525000 && b > a) { queuedLo = a; queuedHi = b; }
+    else if (!strcmp(line, "scan on") || !strcmp(line, "scan off")) queuedScan = line[6] == 'n';
+    else if (!strcmp(line, "speed fast") || !strcmp(line, "speed slow")) queuedSlow = line[6] == 's';
+    else if (!strcmp(line, "log")) queuedLog = 10;
+    else if (sscanf(line, "log %d", &a) == 1 && a > 0) queuedLog = a;
     else if (sscanf(line, "probe %d", &a) == 1 && a >= 410000 && a <= 525000) queuedProbe = a;
     else if (sscanf(line, "send %d", &a) == 1 && a >= 0 && a < tx::NUM_SND) queuedSend = a;
+    else if (sscanf(line, "say %d", &a) == 1 && a > 0 && a <= (int)ble::SPEECH_MAX * 2) { tx::speechN = a; queuedSend = tx::S_SPEECH; }
     else if (sscanf(line, "mode %11s", w) == 1) {
       static const char *const M[] = {"meter", "sweep", "scan", "tx"};
       for (int i = 0; i < 4; i++) if (!strcmp(w, M[i])) queuedMode = i;
-      if (queuedMode < 0) { Serial.printf("CMD ? %s\n", line); continue; }
+      if (queuedMode < 0) { con.printf("CMD ? %s\n", line); continue; }
     } else if (!strcmp(line, "status")) { printStatus(); continue; }
-    else { Serial.printf("CMD ? %s\n", line); continue; }
-    Serial.printf("CMD ok %s\n", line);
+    else { con.printf("CMD ? %s\n", line); continue; }
+    con.printf("CMD ok %s\n", line);
   }
 }
 
@@ -2476,7 +2501,7 @@ static void probe(int khz) {
       for (int k = 0; k < 8; k++) { best = max(best, rf::rssi()); delayMicroseconds(250); }
       n += snprintf(b + n, sizeof b - n, " %d", best);
     }
-    Serial.println(b);
+    con.println(b);
   }
   enterMode(mode);
 }
@@ -2485,7 +2510,7 @@ void setup() {
   Serial.begin(115200);
   serialHook = serialCommands;
   delay(300);
-  Serial.println("\nH@N 433MHz LoRa Module Scanner");
+  con.println("\nH@N 433MHz LoRa Module Scanner");
 
   pinMode(PIN_BOOT, INPUT_PULLUP);
 
@@ -2509,12 +2534,12 @@ void setup() {
   sdOk = sdOpen();                 // stays mounted; shares VSPI with the radio
   detlog::boot = prefs.getUInt("boot", 0) + 1;
   prefs.putUInt("boot", detlog::boot);
-  Serial.printf("LOG boot %lu, SD card %s\n", (unsigned long)detlog::boot,
+  con.printf("LOG boot %lu, SD card %s\n", (unsigned long)detlog::boot,
                 sdOk ? "mounted" : "not found - detections go to serial only");
   if (sdOk) detlog::loadSpurs();
   const char *calFrom = loadCal();
   bool recal = prefs.getBool("recal", false);
-  if (calFrom) Serial.printf("Touch calibration loaded from %s\n", calFrom);
+  if (calFrom) con.printf("Touch calibration loaded from %s\n", calFrom);
   if (!calFrom || recal) {
     prefs.putBool("recal", false);
     runCalibration();
@@ -2530,11 +2555,11 @@ void setup() {
   // default LoRa parameters.
   int st = radio.begin(METER_FREQ_MHZ);
   if (st == RADIOLIB_ERR_NONE) {
-    Serial.println("Radio found - SX1278 responding.");
+    con.println("Radio found - SX1278 responding.");
   } else {
-    Serial.print("Radio NOT found. Error code: ");
-    Serial.println(st);
-    Serial.println("Check NSS and MISO first - those are the usual suspects.");
+    con.print("Radio NOT found. Error code: ");
+    con.println(st);
+    con.println("Check NSS and MISO first - those are the usual suspects.");
     char buf[40];
     snprintf(buf, sizeof(buf), "Radio NOT found (error %d)", st);
     fatal(buf, "Check the NSS and MISO wires");
@@ -2545,13 +2570,23 @@ void setup() {
 #else
   meter::enter();
 #endif
+  ble::begin();                        // after the screen is up: the phone page can connect
 }
 
 void loop() {
-  if (Serial.available()) serialCommands();
+  serialCommands();
   detlog::flush();
-  if (queuedLog) { queuedLog = false; detlog::flush(true); detlog::tail(10); }
+  if (queuedLog) { int n = queuedLog; queuedLog = 0; detlog::flush(true); detlog::tail(n); }
   if (queuedProbe) { int f = queuedProbe; queuedProbe = 0; probe(f); return; }
+#ifdef HAN_LANDSCAPE
+  if (queuedLo || queuedScan >= 0 || queuedSlow >= 0) {
+    if (mode == MODE_TX) switchMode(MODE_SCAN);
+    if (queuedLo) { land::fit(queuedLo, queuedHi); queuedLo = 0; land::setView(land::vStart, land::bpp); }
+    if (queuedScan >= 0) { land::setScan(queuedScan); queuedScan = -1; }
+    if (queuedSlow >= 0) { land::slow = queuedSlow; queuedSlow = -1; land::drawBar(); }
+    return;
+  }
+#endif
   if (queuedMode >= 0) { Mode m = (Mode)queuedMode; queuedMode = -1; switchMode(m); return; }
   if (queuedSend >= 0) { int s = queuedSend; queuedSend = -1; switchMode(MODE_TX); tx::send(s); return; }
   int boot = bootEvent();
