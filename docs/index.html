@@ -63,10 +63,13 @@
   </div>
 
   <h3>What this build does</h3>
-  <p>A single-channel signal meter on 433.000 MHz. The screen shows the live level in dBm,
-  a level bar with peak hold, the noise floor, and a scrolling history graph. Key a
-  433 MHz radio nearby and the bar jumps. Tap the screen to reset the peak. Readings are
-  also printed over USB serial at <code>115200</code> baud. If the radio isn't wired
+  <p>Two screens, switched with the tabs at the bottom. <strong>Meter</strong> shows the
+  live signal level on 433.000 MHz with peak hold, the noise floor and a history graph.
+  <strong>Sweep</strong> scans 430&ndash;440 MHz and draws a spectrum over a scrolling
+  waterfall, so you can see what's transmitting nearby.</p>
+  <p>On the first start it asks you to tap four crosses to calibrate the touch screen
+  (a stylus works best). The result is saved to the SD card and the board's flash. Hold
+  <strong>BOOT</strong> for 2 seconds to calibrate again. If the radio isn't wired
   correctly, the screen says <code>Radio NOT found</code>.</p>
 
   <h3>Flashing failed, or want a clean slate?</h3>
