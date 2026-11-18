@@ -9,6 +9,8 @@
 //                 then one byte per point = dBm + 160 (little-endian; split over several
 //                 notifies when the MTU is small)
 //   6E400005-...  AUDIO (write) speech for TX: u32 byte offset, then 4-bit samples
+//   6E400006-...  LISTEN (notify) live audio from the receiver, see audio()
+//   6E400007-...  STATE (notify) scanner state for the big display and meter, see state()
 // Everything the main loop prints goes through `con` (serial + BLE). The NimBLE task only
 // queues incoming bytes; all sending happens on the main loop.
 #pragma once
@@ -107,6 +109,37 @@ void spectrum(uint32_t startKHz, uint16_t stepKHz, const int16_t *dbm, int n) {
   }
 }
 
+// live audio out (LISTEN): first byte 0 = FM, 1 bit per sample at 16 kHz (MSB first),
+// 1 = AM, one byte per sample at 8 kHz (dBm + 160); dropped when the link is busy
+NimBLECharacteristic *audC;
+void audio(uint8_t kind, const uint8_t *d, int n) {
+  if (!subscribed(audC)) return;
+  uint8_t p[245];
+  int per = min((int)sizeof p, room()) - 1;
+  for (int i = 0; i < n && per > 0; i += per) {
+    int k = min(per, n - i);
+    p[0] = kind;
+    memcpy(p + 1, d + i, k);
+    if (!notify(audC, p, k + 1, false)) return;
+  }
+}
+
+// live state for the page's big frequency display and meter, at most 10 a second
+// (force: a state change): u8 state (0 scanning, 1 locked, 2 listen FM, 3 listen AM,
+// 4 sweep only, 5 transmitting, 6 TX idle), u32 kHz, i16 level dBm (-200 = none),
+// u32 ms in this state (lock/listen time), i16 floor dBm
+NimBLECharacteristic *stateC;
+void state(uint8_t st, int khz, int dbm, uint32_t ms, int floor, bool force = false) {
+  static uint32_t at;
+  static uint8_t last = 255;
+  if (!subscribed(stateC) || (!force && st == last && millis() - at < 100)) return;
+  at = millis(); last = st;
+  uint8_t p[13];
+  int16_t l = dbm, f = floor;
+  p[0] = st; memcpy(p + 1, &khz, 4); memcpy(p + 5, &l, 2); memcpy(p + 7, &ms, 4); memcpy(p + 11, &f, 2);
+  notify(stateC, p, sizeof p, force);
+}
+
 void begin() {
   NimBLEDevice::init("H@N 433");
   NimBLEDevice::setMTU(247);
@@ -117,6 +150,8 @@ void begin() {
   txC = s->createCharacteristic(HAN_UUID(3), NIMBLE_PROPERTY::NOTIFY);
   specC = s->createCharacteristic(HAN_UUID(4), NIMBLE_PROPERTY::NOTIFY);
   s->createCharacteristic(HAN_UUID(5), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)->setCallbacks(new AudioCb);
+  audC = s->createCharacteristic(HAN_UUID(6), NIMBLE_PROPERTY::NOTIFY);
+  stateC = s->createCharacteristic(HAN_UUID(7), NIMBLE_PROPERTY::NOTIFY);
   s->start();
   NimBLEAdvertising *a = NimBLEDevice::getAdvertising();
   a->addServiceUUID(HAN_UUID(1));

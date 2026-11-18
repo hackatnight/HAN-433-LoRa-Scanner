@@ -1332,7 +1332,7 @@ void loop() {
 namespace scan {
 
 const int LOCK_DB = 10;
-const uint32_t HANG_MS = 2000, STEADY_MS = 15000, MAX_LOCK_MS = 60000, SKIP_MS = 10000, LOCKOUT_MS = 300000;
+const uint32_t HANG_MS = 2000, STEADY_MS = 15000, MAX_LOCK_MS = 20000, SKIP_MS = 10000, LOCKOUT_MS = 300000;
 const int BPP = 12, NX = (GBINS + BPP - 1) / BPP, SUBS = 3;   // full range, 192 px
 const int X0 = 24, SP_Y = 150, SP_H = 44, AX_Y = SP_Y + SP_H + 2, HIT_Y = 212;
 
@@ -1786,6 +1786,19 @@ void pushWaterfall() {
 }
 
 // ---- the lock
+const uint32_t PIC_MS = 100;                     // while locked: a picture sweep, a listen, ...
+// LISTEN state (see there); here because picture sweeps run while listening too
+bool lis, lisAm, lisOpen;
+int lisKHz, lisLevel;
+uint32_t lisPic = 1000, lisPicAt;                // a picture sweep every lisPic ms (0 = none)
+uint32_t picAt;
+// A red line through spectrum and waterfall at the locked frequency (any zoom).
+void lockLine() {
+  int lx = (lockG - vStart) / bpp;
+  if (lx < 0 || lx >= npx()) return;
+  lcd.drawFastVLine(X0 + lx, SPEC_Y, SPEC_H, C_ALERT);
+  lcd.drawFastVLine(X0 + lx, WF_Y, WF_H, C_ALERT);
+}
 void endLock(bool longOut) {
   detlog::Det d = {tStart, tLast, (int16_t)lockG, (int16_t)lockG, (int16_t)peak,
                    (int16_t)(peak - lockFloor), hits, 0, true, detlog::SRC_SCAN};
@@ -1794,6 +1807,7 @@ void endLock(bool longOut) {
     for (int g = lockG - 20; g <= lockG + 20; g += 5) scan::skip(constrain(g, 0, GBINS - 1), scan::LOCKOUT_MS);
   else scan::skip(lockG, scan::SKIP_MS);
   locked = false;
+  ble::state(scanOn ? 0 : 4, gKHz(lockG), -200, 0, floorDbm, true);
   rf::setBw(bw());
   if (detlog::total != shownTotal) title();
   panelHits();
@@ -1814,6 +1828,7 @@ void listen() {
   wins++;
   if (over * 2 >= n) { tLast = now; hits++; if (avg > peak) peak = avg; }
   panelLevel(avg);
+  ble::state(1, gKHz(lockG), avg, on, lockFloor);
   char s[24];
   snprintf(s, sizeof s, "LOCKED %lu.%lus", (unsigned long)(on / 1000), (unsigned long)(on % 1000 / 100));
   panelStatus(s, now - tLast < 200 ? C_ALERT : C_TEXT);
@@ -1938,7 +1953,8 @@ void sweepRow() {
     px[x] = best;
     if (best > hold[x]) hold[x] = best;
     if (x % 32 == 0) {
-      if (scanOn) panelFreq(gKHz(pointBin(x, 0)), C_DIM);   // live: where the sweep is
+      if (scanOn && !locked && !lis) panelFreq(gKHz(pointBin(x, 0)), C_DIM);   // live: where the sweep is
+      if (!locked && !lis) ble::state(scanOn ? 0 : 4, gKHz(pointBin(x, 0)), -200, 0, floorDbm);
       pollTouch();
       if (pendingTap.valid || pendingDrag.valid || digitalRead(PIN_BOOT) == LOW) return;
     }
@@ -1955,6 +1971,12 @@ void sweepRow() {
   }
   pushWaterfall();
   ble::spectrum(gKHz(vStart), bpp * G_STEP, px, nx);
+  if (lis) {                                     // a picture sweep while listening: a line there
+    int lx = (lisKHz - gKHz(vStart)) / (bpp * G_STEP);
+    if (lx >= 0 && lx < npx()) { lcd.drawFastVLine(X0 + lx, SPEC_Y, SPEC_H, C_ACCENT); lcd.drawFastVLine(X0 + lx, WF_Y, WF_H, C_ACCENT); }
+    return;
+  }
+  if (locked) { lockLine(); return; }            // a picture sweep during a lock: no scanning
 
   if (!scanOn) {                                 // sweep only: logs the way SWEEP does
     detlog::scan(mv, mg, n, floorDbm, top, t0);
@@ -1976,16 +1998,146 @@ void sweepRow() {
   con.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
   panelFreq(khz, C_TEXT);
   panelStatus("LOCKED", C_ALERT);
-  // A red line through spectrum and waterfall at the locked frequency (any zoom). The
-  // waterfall holds still while locked; the next sweep after the lock draws over it.
-  int lx = (lockG - vStart) / bpp;
-  if (lx >= 0 && lx < npx()) {
-    lcd.drawFastVLine(X0 + lx, SPEC_Y, SPEC_H, C_ALERT);
-    lcd.drawFastVLine(X0 + lx, WF_Y, WF_H, C_ALERT);
+  ble::state(1, khz, peak, 0, lockFloor, true);
+  lockLine();
+  picAt = millis();
+}
+
+// While locked: listen on the lock, with a sweep between listens (PIC_MS) so the spectrum, the
+// waterfall and the phone keep moving, then tune back. A sweep takes well under HANG_MS.
+void lockedLoop() {
+  if (millis() - picAt < PIC_MS) { listen(); return; }
+  sweepRow();
+  picAt = millis();                              // after the sweep: PIC_MS of listening next
+  if (!locked) return;
+  rf::setBw(rf::BW_62);                          // as scan::check left it
+  rf::tune(gKHz(lockG));
+  delayMicroseconds(1000);
+}
+
+// ---- LISTEN: park on one frequency and stream what the receiver hears to the phone
+// (ble::audio). No DIO pin is wired, so it all goes through SPI:
+//   FM: the FSK demodulator's sliced output - the sign of the frequency deviation, i.e.
+//       hard-clipped audio (rough, but speech stays understandable) - one bit every
+//       62.5 us out of the FIFO, in unlimited-length packet mode with no sync word.
+//       AFC re-centers on the carrier each time the squelch opens.
+//   AM: the RSSI (0.5 dB steps) 8000 times a second - on/off and AM signals.
+// Started by "listen KHZ fm|am", it snaps to the loudest point within +-150 kHz first
+// ("listen KHZ fm|am x": exactly there).
+// A tap, BOOT, "listen off" or any view change ends it.
+const uint8_t LIS_BW = 0x0D, LIS_AFC_BW = 0x0B;  // RxBw 12.5 kHz (25 wide), AFC 50 kHz
+uint8_t lisBuf[200];
+int lisN;
+uint32_t lisNext, lisShown, lisT0;
+
+void lisMode(uint8_t m) {                        // RegOpMode: keep FSK + band bits, set mode
+  rf::rw(0x01, (rf::rr(0x01) & 0xF8) | m);
+}
+void lisStop() {
+  if (!lis) return;
+  lis = false;
+  con.println("LISTEN off");
+  ble::state(scanOn ? 0 : 4, lisKHz, -200, 0, floorDbm, true);
+  rf::startRx(bw());
+  panelIdle();
+}
+void lisStart(int khz, bool am, bool exact) {
+  if (locked) endLock(false);
+  // snap: the loudest point within +-150 kHz (10 kHz steps), if it stands out - unless
+  // "exact" (fine tuning from the phone). The scan also gives the floor for the squelch.
+  rf::setBw(LIS_BW);
+  int16_t v[31];
+  int best = 0;
+  for (int i = 0; i < 31; i++) {
+    rf::tune(khz - 150 + i * 10);
+    delayMicroseconds(i ? 400 : 1000);
+    v[i] = -200;
+    for (int k = 0; k < 4; k++) { v[i] = max((int)v[i], rf::rssi()); delayMicroseconds(150); }
+    if (v[i] > v[best]) best = i;
   }
+  int fl, tp;
+  rf::levels(v, 31, fl, tp);
+  if (!exact && v[best] >= fl + 10) khz += -150 + best * 10;
+  lis = true; lisAm = am; lisKHz = khz; lisOpen = false; lisN = 0; lisT0 = millis();
+  lockFloor = fl;                                // panelLevel colors by it
+  uint32_t frf = (uint64_t)khz * 524288 / 32000;
+  radioSPI.beginTransaction(rf::fastSPI);
+  lisMode(1);                                    // standby while changing the setup
+  rf::rw(0x02, 0x07); rf::rw(0x03, 0xD0); rf::rw(0x5D, 0);   // 32 MHz / 2000 = 16 kb/s
+  rf::rw(0x12, LIS_BW); rf::rw(0x13, LIS_AFC_BW);
+  rf::rw(0x1A, 0x01);                            // AfcAutoClearOn
+  rf::rw(0x1F, 0x00);                            // no preamble detector
+  rf::rw(0x27, 0x00);                            // no sync word: the FIFO fills straight away
+  rf::rw(0x30, 0x00);                            // fixed length, no CRC, no whitening
+  rf::rw(0x31, 0x40); rf::rw(0x32, 0x00);        // packet mode, length 0 = unlimited
+  rf::rw(0x06, frf >> 16); rf::rw(0x07, frf >> 8); rf::rw(0x08, frf);
+  rf::rw(0x0D, 0x18);                            // AFC + AGC at each RX start
+  lisMode(5);                                    // RX
+  radioSPI.endTransaction();
+  lisNext = micros(); lisPicAt = millis();
+  con.printf("LISTEN %d.%03d MHz %s\n", khz / 1000, khz % 1000, am ? "am" : "fm");
+  panelFreq(khz, C_ACCENT);
+  panelStatus(am ? "LISTEN AM" : "LISTEN FM", C_ACCENT);
+}
+// Back on the listen frequency after a picture sweep (it changed RxBw, FRF, RxConfig);
+// what the FIFO caught meanwhile is thrown away.
+void lisRetune() {
+  uint32_t frf = (uint64_t)lisKHz * 524288 / 32000;
+  radioSPI.beginTransaction(rf::fastSPI);
+  rf::rw(0x12, LIS_BW); rf::rw(0x13, LIS_AFC_BW);
+  rf::rw(0x06, frf >> 16); rf::rw(0x07, frf >> 8); rf::rw(0x08, frf);
+  rf::rw(0x0D, 0x18 | 0x40);                     // restart RX: AFC + AGC
+  rf::rw(0x3F, 0x10);                            // writing FifoOverrun clears the FIFO
+  radioSPI.endTransaction();
+  lisN = 0; lisOpen = false;
+}
+void lisLoop() {
+  if (lisPic && millis() - lisPicAt >= lisPic) { // the waterfall goes on: one sweep, back
+    sweepRow();
+    lisPicAt = millis();
+    lisRetune();
+    lisNext = micros();
+    return;
+  }
+  if (lisAm) {                                   // ~25 ms of RSSI samples at 8 kHz
+    uint32_t t0 = millis();
+    if (micros() - lisNext > 20000) lisNext = micros();   // fell behind: start again
+    while (millis() - t0 < 25) {
+      while ((int32_t)(micros() - lisNext) < 0) {}
+      lisNext += 125;
+      int v = rf::rssi();
+      lisLevel = v;
+      lisBuf[lisN++] = constrain(v + 160, 0, 255);
+      if (lisN == sizeof lisBuf) { ble::audio(1, lisBuf, lisN); lisN = 0; }
+    }
+  } else {                                       // FM: drain the FIFO (64 bytes = 32 ms)
+    radioSPI.beginTransaction(rf::fastSPI);
+    uint8_t f2;
+    while (!((f2 = rf::rr(0x3F)) & 0x40)) {       // RegIrqFlags2.FifoEmpty
+      lisBuf[lisN++] = rf::rr(0x00);
+      if (lisN == sizeof lisBuf) {
+        radioSPI.endTransaction();
+        ble::audio(0, lisBuf, lisN); lisN = 0;
+        radioSPI.beginTransaction(rf::fastSPI);
+      }
+    }
+    if (f2 & 0x10) rf::rw(0x3F, 0x10);           // FifoOverrun: clear it
+    int v = -(rf::rr(0x11) >> 1);
+    lisLevel = v;
+    if (!lisOpen && v >= lockFloor + 10) { lisOpen = true; rf::rw(0x0D, 0x18 | 0x40); }   // restart RX: AFC
+    else if (lisOpen && v < lockFloor + 6) lisOpen = false;
+    radioSPI.endTransaction();
+  }
+  if (millis() - lisShown > 200) { lisShown = millis(); panelLevel(lisLevel); }
+  ble::state(lisAm ? 3 : 2, lisKHz, lisLevel, millis() - lisT0, lockFloor);
 }
 
 void loop() {
+  if (lis) {                                     // LISTEN: any tap or drag ends it
+    if (tapped() || pendingDrag.valid) { pendingDrag.valid = false; lisStop(); }
+    else lisLoop();
+    return;
+  }
   if (pendingDrag.valid) {                       // drag on the picture: pan
     pendingDrag.valid = false;
     if (pendingDrag.y0 >= SPEC_Y && pendingDrag.y0 < BAR_Y - 4 && bpp < ZOOMS[NZOOM - 1])
@@ -2003,7 +2155,7 @@ void loop() {
     }
     return;
   }
-  if (locked) listen(); else sweepRow();
+  if (locked) lockedLoop(); else sweepRow();
 }
 
 }  // namespace land
@@ -2254,6 +2406,7 @@ void send(int s) {
   rf::rw(0x04, 0); rf::rw(0x05, 0);                       // RegFdev = 0: a plain carrier
   radioSPI.endTransaction();
   radio.transmitDirect();                                 // continuous mode, PA on
+  ble::state(5, fKHz, dbm, 0, 0, true);
 
   armed = false;
   bool stopped = false;
@@ -2278,6 +2431,7 @@ void send(int s) {
   radio.standby();
   uint32_t dt = millis() - t0;
   con.printf("TX done after %lu ms%s\n", (unsigned long)dt, stopped ? " (stopped)" : "");
+  ble::state(6, fKHz, -200, dt, 0, true);
   while (digitalRead(PIN_BOOT) == LOW) delay(10);         // don't let BOOT switch modes
   bootEvent();
   delay(60); pollTouch(); pendingTap.valid = pendingDrag.valid = false;   // the stopping tap
@@ -2293,6 +2447,7 @@ void enter() {
   radio.standby();
   drawAll();
   con.printf("TX ready: %d.%03d MHz\n", fKHz / 1000, fKHz % 1000);
+  ble::state(6, fKHz, -200, 0, 0, true);
 }
 
 void leave() {
@@ -2337,7 +2492,7 @@ static Mode mode = MODE_METER, rxMode = MODE_METER;
 #ifdef HAN_LANDSCAPE
 // Landscape has two screens: the combined one (kept as MODE_SCAN) and TX. Asking for
 // SWEEP or SCAN turns the scanner off or on there; METER just means the combined screen.
-static void leaveMode(Mode m) { if (m == MODE_TX) tx::leave(); else land::leave(); }
+static void leaveMode(Mode m) { if (m == MODE_TX) tx::leave(); else { land::lisStop(); land::leave(); } }
 static void enterMode(Mode m) {
   pendingTap.valid = pendingDrag.valid = false;
   if (m == MODE_TX) { mode = m; tx::enter(); return; }
@@ -2396,6 +2551,8 @@ static void rxMenu() {
 //   stop            stop a transmission     boot           a short BOOT press
 //   log [N]         last 10 (or N) rows of the SD log, as "ROW ..."
 //   view LO HI      landscape: show LO..HI kHz      scan on|off    speed fast|slow
+//   listen KHZ fm|am, listen off                    landscape: live audio to the BLE page
+//   lispic MS       landscape: a waterfall sweep every MS while listening (0 = none)
 //   probe KHZ       fine RSSI profile around KHZ (410000-525000), as "PROBE ..."
 //   mode meter|sweep|scan|tx                send N         TX sound board pad N (0-7)
 //   say N           send N samples of speech the BLE page wrote to ble::speech
@@ -2407,6 +2564,7 @@ static int queuedMode = -1, queuedSend = -1, queuedProbe;
 static void probe(int khz);
 static bool queuedBoot;
 static int queuedLo, queuedHi, queuedScan = -1, queuedSlow = -1;   // landscape: view, scan, speed
+static int queuedListen, queuedAm, queuedExact;  // landscape: listen KHZ (-1 = off)
 static int queuedLog;                 // "log" = last 10 rows, "log N" = last N
 
 static void printStatus() {
@@ -2450,6 +2608,14 @@ static void serialCommands() {
     else if (!strcmp(line, "boot")) queuedBoot = true;
     else if (sscanf(line, "view %d %d", &a, &b) == 2 && a >= 410000 && b <= 525000 && b > a) { queuedLo = a; queuedHi = b; }
     else if (!strcmp(line, "scan on") || !strcmp(line, "scan off")) queuedScan = line[6] == 'n';
+    else if (!strcmp(line, "listen off")) queuedListen = -1;
+#ifdef HAN_LANDSCAPE
+    else if (sscanf(line, "lispic %d", &a) == 1 && a >= 0 && a <= 10000) land::lisPic = a;
+#endif
+    else if (sscanf(line, "listen %d %3s", &a, w) == 2 && a >= 410000 && a <= 525000 && (!strcmp(w, "fm") || !strcmp(w, "am"))) {
+      queuedListen = a; queuedAm = w[0] == 'a';
+      queuedExact = strlen(line) > 2 && !strcmp(line + strlen(line) - 2, " x");
+    }
     else if (!strcmp(line, "speed fast") || !strcmp(line, "speed slow")) queuedSlow = line[6] == 's';
     else if (!strcmp(line, "log")) queuedLog = 10;
     else if (sscanf(line, "log %d", &a) == 1 && a > 0) queuedLog = a;
@@ -2579,8 +2745,16 @@ void loop() {
   if (queuedLog) { int n = queuedLog; queuedLog = 0; detlog::flush(true); detlog::tail(n); }
   if (queuedProbe) { int f = queuedProbe; queuedProbe = 0; probe(f); return; }
 #ifdef HAN_LANDSCAPE
+  if (queuedListen) {
+    int f = queuedListen; queuedListen = 0;
+    if (mode == MODE_TX) switchMode(MODE_SCAN);
+    land::lisStop();
+    if (f > 0) land::lisStart(f, queuedAm, queuedExact);
+    return;
+  }
   if (queuedLo || queuedScan >= 0 || queuedSlow >= 0) {
     if (mode == MODE_TX) switchMode(MODE_SCAN);
+    land::lisStop();
     if (queuedLo) { land::fit(queuedLo, queuedHi); queuedLo = 0; land::setView(land::vStart, land::bpp); }
     if (queuedScan >= 0) { land::setScan(queuedScan); queuedScan = -1; }
     if (queuedSlow >= 0) { land::slow = queuedSlow; queuedSlow = -1; land::drawBar(); }
@@ -2588,12 +2762,25 @@ void loop() {
   }
 #endif
   if (queuedMode >= 0) { Mode m = (Mode)queuedMode; queuedMode = -1; switchMode(m); return; }
-  if (queuedSend >= 0) { int s = queuedSend; queuedSend = -1; switchMode(MODE_TX); tx::send(s); return; }
+  if (queuedSend >= 0) {
+    int s = queuedSend; queuedSend = -1;
+#ifdef HAN_LANDSCAPE
+    // sent from the PC / phone: afterwards, back to what it was doing (scan, or listening)
+    Mode back = mode;
+    bool wasLis = land::lis, lisAm = land::lisAm;
+    int lisK = land::lisKHz;
+    switchMode(MODE_TX); tx::send(s);
+    if (back != MODE_TX) { switchMode(MODE_SCAN); if (wasLis) land::lisStart(lisK, lisAm, true); }
+#else
+    switchMode(MODE_TX); tx::send(s);
+#endif
+    return;
+  }
   int boot = bootEvent();
   if (queuedBoot) { queuedBoot = false; boot = 1; }
   if (boot == 1) {                       // short press: METER -> SWEEP -> SCAN (in RX)
 #ifdef HAN_LANDSCAPE
-    if (mode != MODE_TX) land::setScan(!land::scanOn);   // landscape: Scan on/off
+    if (mode != MODE_TX) { land::lisStop(); land::setScan(!land::scanOn); }   // landscape: Scan on/off
     return;
 #endif
     if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : mode == MODE_SWEEP ? MODE_SCAN : MODE_METER);
