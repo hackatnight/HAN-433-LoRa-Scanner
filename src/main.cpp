@@ -1024,9 +1024,9 @@ void pollSerial() {
 // A window onto the grid: NPX pixels from grid bin vStart, bpp grid bins per pixel
 // (zoom 1 / 2 / 3 / 5 / 12 = 10 / 20 / 30 / 50 / 115 MHz wide). The receiver widens with
 // the zoom (62.5 / 125 / 250 kHz); where a pixel spans more than the receiver hears it is
-// measured at several points and shows the loudest. Drag to pan, tap the frequency axis
-// to zoom in there (from the closest zoom: back out to the full range), tap the spectrum
-// to clear the max hold. The header Menu has band presets.
+// measured at several points and shows the loudest. Buttons under the axis: < > move a
+// screen width, - + zoom around the center. Drag to pan finely, tap the spectrum to clear
+// the max hold. The header Menu has band presets.
 namespace sweep {
 
 const int NPX = 200;
@@ -1042,7 +1042,9 @@ const int X0 = 20, SPEC_Y = 52, SPEC_H = 90, AXIS_Y = SPEC_Y + SPEC_H + 3;
 // works on frame-memory rows, and with rotation 2 (MY set) screen row y is memory row
 // 319 - y. So, in memory rows:
 //   TFA = the tabs strip at the screen bottom, VSA = the waterfall, BFA = everything above.
-const int WF_Y = 158, WF_H = 124;
+// Under the axis labels: [<] [-] span [+] [>] buttons.
+const int BTN_Y = AXIS_Y + 12, BTN_H = 26;
+const int WF_Y = BTN_Y + BTN_H + 3, WF_H = 284 - WF_Y;
 const int TFA = 320 - WF_Y - WF_H, VSA = WF_H, BFA = WF_Y;
 // Rotation 2 sets MX|MY|ML|MH. ML/MH only reverse the panel's refresh order, but ML also
 // flips where the scroll areas sit, so drop both while sweeping: same picture, one layout.
@@ -1094,8 +1096,32 @@ void drawPx(int i) {
 }
 
 // MHz labels for the current view, every 50 px.
+// Button row: x, width of < - + > and whether each can do anything in this view.
+const int BX[4] = {4, 48, 152, 196}, BW = 40;
+bool btnOn(int i) {
+  int z = 0;
+  while (z < NZOOM && ZOOMS[z] != bpp) z++;
+  return i == 0 ? vStart > 0 : i == 1 ? z < NZOOM - 1 : i == 2 ? z > 0 : vStart + NPX * bpp < GBINS;
+}
+void drawButtons() {
+  static const char *const lab[4] = {"<", "-", "+", ">"};
+  lcd.fillRect(0, BTN_Y, SCR_W, BTN_H, C_BG);
+  for (int i = 0; i < 4; i++) {
+    bool on = btnOn(i);
+    uiButton(BX[i], BTN_Y, BW, BTN_H, lab[i], C_PANEL, on ? C_ACCENT : C_PANEL, on ? C_TEXT : C_DIM);
+  }
+  char b[12];
+  int khz = min(NPX * bpp, GBINS) * G_STEP;
+  snprintf(b, sizeof b, "%d MHz", khz / 1000);
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(b, SCR_W / 2, BTN_Y + BTN_H / 2);
+  lcd.setTextDatum(top_left);
+}
+
 void drawAxis() {
-  lcd.fillRect(X0 - 8, AXIS_Y - 2, NPX + 16, WF_Y - AXIS_Y + 2, C_BG);
+  lcd.fillRect(0, AXIS_Y - 2, SCR_W, BTN_Y - AXIS_Y + 2, C_BG);
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(C_DIM, C_BG);
   lcd.setTextDatum(top_center);
@@ -1129,6 +1155,7 @@ void setView(int start, int zoom) {
   lcd.fillRect(X0, SPEC_Y, NPX, SPEC_H, C_BG);
   lcd.fillRect(X0, WF_Y, NPX, WF_H, C_BG);        // every waterfall row, wherever it scrolled
   drawAxis();
+  drawButtons();
   int a = gKHz(vStart), b = gKHz(vStart + npx() * bpp);
   Serial.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
                 b / 1000, b % 1000 / 10, bpp * G_STEP);
@@ -1141,13 +1168,18 @@ void setBand(int loKHz, int hiKHz) {
   bpp = z;
   vStart = ((loKHz + hiKHz) / 2 - G0_KHZ) / G_STEP - NPX * z / 2;   // setView clamps it on entry
 }
-// Tap on the axis: one zoom step in around that spot; from the closest, the full range.
-void zoomAt(int sx) {
-  int center = vStart + constrain(sx - X0, 0, NPX - 1) * bpp;
+// The button row: < > a screen width lower / higher, - + one zoom step around the center.
+void button(int i) {
+  if (!btnOn(i)) return;
   int z = 0;
   while (z < NZOOM && ZOOMS[z] != bpp) z++;
-  int nb = z <= 0 ? ZOOMS[NZOOM - 1] : ZOOMS[z - 1];
-  setView(nb == ZOOMS[NZOOM - 1] ? 0 : center - NPX * nb / 2, nb);
+  int span = NPX * bpp, center = vStart + min(span, GBINS) / 2;
+  if (i == 0) setView(vStart - span, bpp);
+  else if (i == 3) setView(vStart + span, bpp);
+  else {
+    int nb = ZOOMS[i == 1 ? z + 1 : z - 1];
+    setView(center - NPX * nb / 2, nb);
+  }
 }
 
 void enter() {
@@ -1188,8 +1220,9 @@ void loop() {
   }
   if (tapped()) {
     int x = pendingTap.x, y = pendingTap.y;
-    if (y >= AXIS_Y - 6 && y < WF_Y) zoomAt(x);
-    else if (y >= SPEC_Y) for (int i = 0; i < NPX; i++) hold[i] = px[i];
+    if (y >= BTN_Y - 4 && y < BTN_Y + BTN_H + 4) {
+      for (int i = 0; i < 4; i++) if (x >= BX[i] - 2 && x < BX[i] + BW + 2) button(i);
+    } else if (y >= SPEC_Y && y < BTN_Y) for (int i = 0; i < NPX; i++) hold[i] = px[i];
     return;
   }
   uint32_t t0 = millis();
@@ -1200,6 +1233,8 @@ void loop() {
   lcd.drawFastHLine(X0, 319 - wfRow, NPX, C_BG);
   scrollTo(vsp);
   const int nx = npx(), ns = subs();
+  // A wider receiver settles faster: 200 / 150 / 120 us at 62.5 / 125 / 250 kHz.
+  const uint32_t dwell = bpp == 1 ? SWEEP_DWELL_US : bpp == 2 ? 150 : 120;
   rf::tune(gKHz(pointBin(0, 0)));                // the jump back to the start: 1 ms for the PLL
   delayMicroseconds(1000);
 
@@ -1211,7 +1246,7 @@ void loop() {
       int g = pointBin(x, s);
       rf::tune(gKHz(g));
       if (x && !s) drawPx(x - 1);
-      while (micros() - t < SWEEP_DWELL_US) {}
+      while (micros() - t < dwell) {}
       int v = rf::rssi();
       mv[n] = v; mg[n++] = g;
       if (v > best) best = v;
