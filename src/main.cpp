@@ -45,10 +45,10 @@
 static const float METER_FREQ_MHZ = 433.0;
 static const float METER_BW_KHZ = 125.0;   // RadioLib's default
 
-// Sweep: SWEEP_BINS steps of SWEEP_STEP_MHZ from SWEEP_START_MHZ.
-static const float SWEEP_START_MHZ = 430.0;
-static const float SWEEP_STEP_MHZ = 0.05;
-static const int   SWEEP_BINS = 200;               // 430.00 - 439.95 MHz
+// The grid everything is measured on: 410.00-524.95 MHz in 50 kHz steps, the range the
+// Ra-01's antenna matching is built for.
+static const int G0_KHZ = 410000, G_STEP = 50, GBINS = 2300;
+static inline int gKHz(int g) { return G0_KHZ + g * G_STEP; }
 static const float SWEEP_BW_KHZ = 62.5;   // FSK receiver bandwidth, close to the step
 // Time to let the PLL lock and the RSSI settle after each retune. Too short and a
 // signal shows up a bin or two late (to the right of where it is). Each sweep
@@ -471,22 +471,39 @@ static void runCalibration() {
 // ---------------------------------------------------------------- touch input
 struct Tap { bool valid; int x, y; };
 static Tap pendingTap = {false, 0, 0};
+struct DragEv { bool valid; int dx, y0; };
+static DragEv pendingDrag = {false, 0, 0};
 
-// Call often. Latches one tap per press (the press edge), polled every 30 ms.
+// Call often (polls every 30 ms). A press that ends where it started (within DRAG_PX
+// sideways) is a tap at the press point; one that moved further is a drag. Both are
+// latched when the finger lifts, so a press can still turn into a drag.
+static const int DRAG_PX = 15;
 static void pollTouch() {
-  static bool was = false;
+  static bool down = false;
+  static int x0, y0, x1;
   static uint32_t last = 0;
   if (millis() - last < 30) return;
   last = millis();
   int rx, ry;
   bool now = readTouchRaw(rx, ry);
-  if (now && !was) {
+  if (now) {
     int sx = -1, sy = -1;
     rawToScreen(rx, ry, sx, sy);   // stays -1,-1 when uncalibrated (never a tab)
-    pendingTap = {true, sx, sy};
-    Serial.printf("TOUCH raw %d,%d -> screen %d,%d\n", rx, ry, sx, sy);
+    if (!down) { x0 = x1 = sx; y0 = sy; Serial.printf("TOUCH raw %d,%d -> screen %d,%d\n", rx, ry, sx, sy); }
+    else x1 = sx;
+  } else if (down) {
+    if (abs(x1 - x0) > DRAG_PX) { pendingDrag = {true, x1 - x0, y0}; Serial.printf("TOUCH drag %d\n", x1 - x0); }
+    else pendingTap = {true, x0, y0};
   }
-  was = now;
+  down = now;
+}
+// For han_ui.h's uiList(): the next tap, if there is one.
+static bool takeTap(int &x, int &y) {
+  pollTouch();
+  if (!pendingTap.valid) return false;
+  pendingTap.valid = false;
+  x = pendingTap.x; y = pendingTap.y;
+  return true;
 }
 
 // Taps on the tab bar or the header button are navigation; the main loop takes them.
@@ -572,7 +589,7 @@ void drawStatic() {
   lcd.fillScreen(C_BG);
   char buf[24];
   snprintf(buf, sizeof(buf), "METER %.3f", METER_FREQ_MHZ);
-  uiHeader(buf, "Sweep");
+  uiHeader(buf, "Menu");
 
   lcd.setFont(&fonts::Font2);
   lcd.setTextDatum(top_center);
@@ -702,36 +719,103 @@ void loop() {
 
 }  // namespace meter
 
+// ================================================================ RADIO (raw FSK)
+// SWEEP and SCAN run the radio in FSK mode: its RSSI is smoothed over just 2 samples
+// and the receiver can be relocked onto a new frequency with one register write, so a
+// reading is valid ~0.2 ms after a retune. LoRa mode's RSSI is averaged far longer.
+// RadioLib's setFrequency()/startReceive() verify every register they touch (~1.4 ms
+// per step); a step here is 4 writes and 1 read over raw SPI.
+namespace rf {
+
+SPISettings fastSPI(8000000, MSBFIRST, SPI_MODE0);
+inline void rw(uint8_t reg, uint8_t val) {
+  digitalWrite(PIN_NSS, LOW); radioSPI.transfer16((reg | 0x80) << 8 | val); digitalWrite(PIN_NSS, HIGH);
+}
+inline uint8_t rr(uint8_t reg) {
+  digitalWrite(PIN_NSS, LOW); uint8_t v = radioSPI.transfer16(reg << 8); digitalWrite(PIN_NSS, HIGH);
+  return v;
+}
+const uint8_t RX_CFG = 0x08;             // RegRxConfig: AGC on, AFC off, no trigger
+// RegRxBw: mantissa 16, exponent 3 / 2 / 1 = 62.5 / 125 / 250 kHz
+const uint8_t BW_62 = 0x03, BW_125 = 0x02, BW_250 = 0x01;
+
+void tune(int khz) {
+  uint32_t frf = (uint64_t)khz * 524288 / 32000;   // f x 2^19 / 32 MHz
+  radioSPI.beginTransaction(fastSPI);
+  rw(0x06, frf >> 16); rw(0x07, frf >> 8); rw(0x08, frf);
+  rw(0x0D, RX_CFG | 0x20);               // RestartRxWithPllLock: relock on the new frequency
+  radioSPI.endTransaction();
+}
+int rssi() {                             // FSK RegRssiValue = -2 x dBm
+  radioSPI.beginTransaction(fastSPI);
+  int v = -(rr(0x11) >> 1);
+  radioSPI.endTransaction();
+  return v;
+}
+void setBw(uint8_t v) {
+  radioSPI.beginTransaction(fastSPI);
+  rw(0x12, v); rw(0x0D, RX_CFG | 0x20);
+  radioSPI.endTransaction();
+}
+void startRx(uint8_t bw) {
+  radio.beginFSK(433.0, 4.8, 5.0, SWEEP_BW_KHZ);
+  radio.startReceive();
+  radioSPI.beginTransaction(fastSPI);
+  rw(0x0E, 0x00);                        // RegRssiConfig: no offset, smoothing 2 samples
+  rw(0x0D, RX_CFG);
+  radioSPI.endTransaction();
+  setBw(bw);
+}
+
+// Floor (25th percentile) and noise top (95th) of n readings, by counting whole dB.
+void levels(const int16_t *v, int n, int &floor, int &top) {
+  uint16_t cnt[136] = {0};
+  for (int i = 0; i < n; i++) { int k = v[i] + 140; cnt[k < 0 ? 0 : k > 135 ? 135 : k]++; }
+  floor = -140;
+  for (int k = 0, c = 0; k < 136; k++) if ((c += cnt[k]) >= n / 4) { floor = k - 140; break; }
+  top = 135;
+  for (int c = 0; top > 0 && (c += cnt[top]) < n / 20 + 1; top--) {}
+  top -= 140;
+}
+
+}  // namespace rf
+
 // ================================================================ DETECTION LOG
-// The 2-sample RSSI is noisy: ~10% of bins sit 10+ dB over the floor (25th percentile)
-// in quiet air. So thresholds hang off each sweep's "noise top" instead - its 95th
-// percentile (10th-loudest bin). A detection = a run of bins at least ON_DB over the
-// noise top, seen again in the very next sweep. It stays open while a run within NEAR bins
-// of where it started stays OFF_DB over the noise top - the bin never moves, so it
-// can't wander from spike to spike - and ends after MISS sweeps without one. The logged
-// SNR is relative to the floor. Ended detections are printed over
-// serial ("DET ...") and kept in RAM, then appended to the SD card in batches between
-// sweeps: when FLUSH_N are waiting or the oldest has waited FLUSH_MS.
+// Everything works on one fixed grid: 410.00-524.95 MHz in 50 kHz steps (GBINS bins) -
+// the range the Ra-01's antenna matching is built for (the SX1278 itself tunes
+// 137-525 MHz, but below 410 the module hears little). SWEEP and SCAN measure points on
+// the grid; detections and learned spurs are kept per grid bin.
 //
-// Time: every row has the boot number (NVS counter) and uptime in ms. Once the PC has
-// sent "T<unix ms>" over serial, rows also get UTC - including rows still in RAM.
+// SWEEP detections: the 2-sample RSSI is noisy, so thresholds hang off each sweep's
+// "noise top", its 95th percentile. A detection = a run of points at least ON_DB over
+// the noise top, seen again in the very next sweep. It stays open while a run near where
+// it started stays OFF_DB over the noise top - the bin never moves, so it can't wander
+// from spike to spike - and ends after MISS sweeps without one. SCAN logs its own (see
+// there). The logged SNR is relative to the floor.
+//
+// Ended detections are printed over serial ("DET ...") and kept in RAM, then appended to
+// the SD card in batches between sweeps: when FLUSH_N are waiting or the oldest has
+// waited FLUSH_MS. Every row has the boot number (NVS counter) and uptime in ms; once the
+// PC has sent "T<unix ms>" over serial, rows also get UTC - including rows still in RAM.
 namespace detlog {
 
 const int ON_DB = 6, OFF_DB = 1;     // dB over the noise top to open / to stay open
-// The ESP32's 40 MHz crystal x 11 = 440.000 MHz: its skirt fills 439.60-439.95 on every
-// unit and comes and goes, so those bins are shown but not scanned for detections.
-const int SPUR_BIN = 192;            // 439.60 MHz
-// Other spurs (this board: 432.05, 436.7, 437.95, 438.35) are learned: busy[i] is how
-// often bin i is over the stay-open level, averaged over ~2048 sweeps (~95 s), 65535 =
-// always. A bin counts as quiet - a spur, or a steady local emitter - when it or a
-// neighbor is busier than SPUR_BUSY (a spur's skirt flickers less than its center).
+// The ESP32's 40 MHz crystal lands at 440, 480 and 520 MHz; its skirts come and go, so
+// +-400 kHz around each is shown but never detected.
+bool xtal(int g) {
+  int khz = gKHz(g);
+  for (int h = 440000; h <= 520000; h += 40000) if (abs(khz - h) <= 400) return true;
+  return false;
+}
+// Other spurs are learned: busy[g] is how often bin g is over the stay-open level when
+// measured, averaged over ~2048 measurements, 65535 = always. A bin counts as quiet - a
+// spur, or a steady local emitter - when it or a neighbor is busier than SPUR_BUSY.
 // Spurs here flicker at 5-15%; a 2 s burst only lifts busy to ~2%. Learning is slow on
 // purpose (a fast learner takes an early real signal for a spur), so the learned bins
-// are kept on the SD card as a 200-bit map and loaded at boot: only the first run on a
-// card has a warm-up (a minute or two of spur rows).
+// are kept on the SD card as a bit map and loaded at boot.
 const int32_t SPUR_BUSY = 65535 * 5 / 100;
-uint16_t busy[SWEEP_BINS];
-uint8_t spurMap[SWEEP_BINS / 8];     // learned spur bins, as last saved / loaded
+uint16_t busy[GBINS];
+uint8_t spurMap[(GBINS + 7) / 8];    // learned spur bins, as last saved / loaded
 bool spurDirty;                      // the learned bins differ from spurMap
 uint32_t spurSaved;                  // millis() of the last save
 const uint32_t SPUR_SAVE_MS = 60000;
@@ -739,19 +823,26 @@ const char *SPUR_FILE = "/han433_spur.bin";
 const int MISS = 2;                  // sweeps a signal may drop out before it ends
 const int NEAR = 3;                  // a run within 3 bins (150 kHz) continues a detection
 // A transmitter close by overloads the front end and shows sidelobes up to ~1 MHz out,
-// 30-40 dB down: a run SIDE_DB under the loudest bin within SIDE bins is ignored.
+// 30-40 dB down: a run SIDE_DB under the loudest point within SIDE bins is ignored.
 const int SIDE = 20, SIDE_DB = 25;
 const uint32_t MAX_MS = 60000;       // a carrier that never stops: one row a minute
-const int NOPEN = 8, NBUF = 32, FLUSH_N = 16;
+const int NOPEN = 8, NBUF = 32, FLUSH_N = 16, NRECENT = 4;
 const uint32_t FLUSH_MS = 30000;
-const char *FILE_NAME = "/han433_det.csv";
+const char *FILE_NAME = "/han433_log.csv";
+enum { SRC_SWEEP, SRC_SCAN };
 
 // at = bin it opened on (fixed), bin = loudest bin; ok = confirmed (seen 2 sweeps running)
-struct Det { uint32_t t0, t1; int16_t bin, at, peak, snr; uint16_t sweeps; uint8_t miss; bool ok; };
-Det act[NOPEN], buf[NBUF];
-int nOpen, nBuf, hot, spurs;         // last sweep: bins over the open level / learned spurs
+// hits = sweeps it was seen in (SWEEP) or 50 ms windows it was heard in (SCAN)
+struct Det { uint32_t t0, t1; int16_t bin, at, peak, snr; uint16_t hits; uint8_t miss; bool ok; uint8_t src; };
+Det act[NOPEN], buf[NBUF], recent[NRECENT];
+int nOpen, nBuf, nRecent, hot, spurs;   // last sweep: points over the open level / spurs
 uint32_t total, dropped, boot, pendSince;
 int64_t utcOffMs;                    // unix ms - millis(); 0 = clock not set
+
+bool isSpur(int g) {
+  return xtal(g) || busy[g] > SPUR_BUSY || (g && busy[g - 1] > SPUR_BUSY) ||
+         (g < GBINS - 1 && busy[g + 1] > SPUR_BUSY);
+}
 
 // "2026-11-18T14:03:22.123Z", or "" before the clock is set.
 void utc(char *s, uint32_t ms) {
@@ -773,51 +864,62 @@ void setClock(uint64_t unixMs) {
 }
 
 void emit(const Det &d) {
-  if (!d.sweeps) return;
-  int khz = 430000 + d.bin * 50;
-  Serial.printf("DET %d.%03d MHz  %d dBm  +%d dB  %lu ms  %u sweeps\n", khz / 1000, khz % 1000,
-                d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.sweeps);
+  if (!d.hits) return;
+  int khz = gKHz(d.bin);
+  Serial.printf("DET %s %d.%03d MHz  %d dBm  +%d dB  %lu ms  %u hits\n", d.src ? "SCAN" : "SWEEP",
+                khz / 1000, khz % 1000, d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.hits);
   total++;
+  memmove(recent + 1, recent, sizeof(Det) * (NRECENT - 1));   // newest first
+  recent[0] = d;
+  if (nRecent < NRECENT) nRecent++;
   if (!sdOk) return;
   if (nBuf == NBUF) { dropped++; return; }
   if (!nBuf) pendSince = millis();
   buf[nBuf++] = d;
 }
 
-// After each sweep: the bins in dBm, the sweep's floor and noise top, its start time.
-void scan(const int16_t *bins, int n, int floor, int top, uint32_t now) {
-  const int on = top + ON_DB, off = top + OFF_DB;
-  bool seen[NOPEN] = {};
-  bool lit[SWEEP_BINS];                                     // over off, and not a spur
-  hot = spurs = 0;
-  for (int i = 0; i < n; i++) {
-    busy[i] += ((bins[i] >= off ? 65535 : 0) - (int32_t)busy[i]) >> 11;
+// Spur learning, for every measured point: v[] dBm at grid bins g[], off = stay-open level.
+void learn(const int16_t *v, const uint16_t *g, int n, int off) {
+  for (int k = 0; k < n; k++) {
+    int i = g[k];
+    busy[i] += ((v[k] >= off ? 65535 : 0) - (int32_t)busy[i]) >> 11;
     uint8_t bit = 1 << (i & 7), &m = spurMap[i >> 3];
     if ((busy[i] > SPUR_BUSY) != !!(m & bit)) { m ^= bit; spurDirty = true; }
   }
-  for (int i = 0; i < n; i++) {
-    bool spur = busy[i] > SPUR_BUSY || (i && busy[i - 1] > SPUR_BUSY) ||
-                (i < n - 1 && busy[i + 1] > SPUR_BUSY);
+}
+
+// After each SWEEP: n points v[] (dBm) at grid bins g[] (ascending), the sweep's floor
+// and noise top, its start time.
+void scan(const int16_t *v, const uint16_t *g, int n, int floor, int top, uint32_t now) {
+  const int on = top + ON_DB, off = top + OFF_DB;
+  const int step = n > 1 ? max(1, g[1] - g[0]) : 1;        // grid bins between points
+  const int near = max(NEAR, step), side = max(1, SIDE / step);
+  static bool lit[600];                                     // over off, and not a spur
+  bool seen[NOPEN] = {};
+  learn(v, g, n, off);
+  hot = spurs = 0;
+  for (int k = 0; k < n; k++) {
+    bool spur = isSpur(g[k]);
     spurs += spur;
-    lit[i] = bins[i] >= off && !spur;
-    hot += lit[i] && bins[i] >= on;
+    lit[k] = v[k] >= off && !spur;
+    hot += lit[k] && v[k] >= on;
   }
   for (int i = 0; i < n;) {
     if (!lit[i]) { i++; continue; }
-    int r0 = i, p = i;                                      // run r0..i-1, peak bin p
-    for (; i < n && lit[i]; i++) if (bins[i] > bins[p]) p = i;
-    int big = bins[p];                                      // loudest within +-1 MHz
-    for (int j = p < SIDE ? 0 : p - SIDE; j <= p + SIDE && j < n; j++) if (bins[j] > big) big = bins[j];
-    if (bins[p] <= big - SIDE_DB) continue;                 // a strong neighbor's sidelobe
+    int r0 = i, p = i;                                      // run r0..i-1, peak point p
+    for (; i < n && lit[i]; i++) if (v[i] > v[p]) p = i;
+    int big = v[p];                                         // loudest within +-1 MHz
+    for (int j = p < side ? 0 : p - side; j <= p + side && j < n; j++) if (v[j] > big) big = v[j];
+    if (v[p] <= big - SIDE_DB) continue;                    // a strong neighbor's sidelobe
     int k = 0;
-    while (k < nOpen && (act[k].at < r0 - NEAR || act[k].at > i - 1 + NEAR)) k++;
+    while (k < nOpen && (act[k].at < g[r0] - near || act[k].at > g[i - 1] + near)) k++;
     if (k == nOpen) {                                       // a new signal?
-      if (bins[p] < on || nOpen == NOPEN) continue;
-      act[nOpen++] = {now, now, (int16_t)p, (int16_t)p, -128, 0, 0, 0, false};
+      if (v[p] < on || nOpen == NOPEN) continue;
+      act[nOpen++] = {now, now, (int16_t)g[p], (int16_t)g[p], -128, 0, 0, 0, false, SRC_SWEEP};
     }
     Det &d = act[k];
-    if (!seen[k]) { seen[k] = true; d.t1 = now; d.ok |= ++d.sweeps >= 2; d.miss = 0; }
-    if (bins[p] > d.peak) { d.peak = bins[p]; d.bin = p; d.snr = bins[p] - floor; }
+    if (!seen[k]) { seen[k] = true; d.t1 = now; d.ok |= ++d.hits >= 2; d.miss = 0; }
+    if (v[p] > d.peak) { d.peak = v[p]; d.bin = g[p]; d.snr = v[p] - floor; }
   }
   for (int k = 0; k < nOpen;) {
     Det &d = act[k];
@@ -828,21 +930,39 @@ void scan(const int16_t *bins, int n, int floor, int top, uint32_t now) {
     }
     if (now - d.t0 >= MAX_MS) {                             // still there after a minute
       emit(d);
-      d.t0 = d.t1 = now; d.sweeps = 0; d.peak = -128;
+      d.t0 = d.t1 = now; d.hits = 0; d.peak = -128;
     }
     k++;
   }
 }
 
-// Setup, SD card mounted: start from the spurs learned last time.
+// The view changed: what was open can't be followed any more. Log the confirmed ones.
+void closeAll() {
+  for (int k = 0; k < nOpen; k++) if (act[k].ok) emit(act[k]);
+  nOpen = 0;
+}
+
+// Setup, SD card mounted: start from the spurs learned last time. A map from before the
+// full-range grid (25 bytes, 430.00-439.95 MHz) is moved to its place on the grid.
 void loadSpurs() {
   File f = SD.open(SPUR_FILE, FILE_READ);
   if (!f) return;
   int got = f.read(spurMap, sizeof spurMap);
   f.close();
-  if (got != sizeof spurMap) { memset(spurMap, 0, sizeof spurMap); return; }
+  if (got == 25) {
+    uint8_t old[25];
+    memcpy(old, spurMap, 25);
+    memset(spurMap, 0, sizeof spurMap);
+    const int at = (430000 - G0_KHZ) / G_STEP;
+    for (int i = 0; i < 200; i++)
+      if (old[i >> 3] & 1 << (i & 7)) spurMap[(at + i) >> 3] |= 1 << ((at + i) & 7);
+    spurDirty = true;
+  } else if (got != sizeof spurMap) {
+    memset(spurMap, 0, sizeof spurMap);
+    return;
+  }
   int n = 0;
-  for (int i = 0; i < SWEEP_BINS; i++)
+  for (int i = 0; i < GBINS; i++)
     if (spurMap[i >> 3] & 1 << (i & 7)) { busy[i] = SPUR_BUSY * 2; n++; }
   Serial.printf("LOG %d spur bins loaded from SD card\n", n);
 }
@@ -867,14 +987,15 @@ void flush() {
   File f = SD.open(FILE_NAME, FILE_APPEND);
   bool ok = f;
   if (ok) {
-    if (!f.size()) f.println("boot,uptime_ms,utc,freq_mhz,peak_dbm,snr_db,dur_ms,sweeps");
+    if (!f.size()) f.println("boot,uptime_ms,utc,mode,freq_mhz,peak_dbm,snr_db,dur_ms,hits");
     char s[28];
     for (int k = 0; k < nBuf; k++) {
       const Det &d = buf[k];
-      int khz = 430000 + d.bin * 50;
+      int khz = gKHz(d.bin);
       utc(s, d.t0);
-      f.printf("%lu,%lu,%s,%d.%03d,%d,%d,%lu,%u\n", (unsigned long)boot, (unsigned long)d.t0, s,
-               khz / 1000, khz % 1000, d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.sweeps);
+      f.printf("%lu,%lu,%s,%s,%d.%03d,%d,%d,%lu,%u\n", (unsigned long)boot, (unsigned long)d.t0, s,
+               d.src ? "SCAN" : "SWEEP", khz / 1000, khz % 1000, d.peak, d.snr,
+               (unsigned long)(d.t1 - d.t0), d.hits);
     }
     f.close();
   } else dropped += nBuf;
@@ -900,15 +1021,26 @@ void pollSerial() {
 }  // namespace detlog
 
 // ================================================================ SWEEP
+// A window onto the grid: NPX pixels from grid bin vStart, bpp grid bins per pixel
+// (zoom 1 / 2 / 3 / 5 / 12 = 10 / 20 / 30 / 50 / 115 MHz wide). The receiver widens with
+// the zoom (62.5 / 125 / 250 kHz); where a pixel spans more than the receiver hears it is
+// measured at several points and shows the loudest. Drag to pan, tap the frequency axis
+// to zoom in there (from the closest zoom: back out to the full range), tap the spectrum
+// to clear the max hold. The header Menu has band presets.
 namespace sweep {
 
-// Everything is integer dBm. Spectrum: -130..-10 dBm into 90 px (3/4 px per dB).
-const int X0 = 20, SPEC_Y = 52, SPEC_H = 90, AXIS_Y = SPEC_Y + SPEC_H + 3;   // below the 32 px header
+const int NPX = 200;
+const int ZOOMS[] = {1, 2, 3, 5, 12};
+const int NZOOM = 5;
+int vStart = (430000 - G0_KHZ) / G_STEP, bpp = 1;   // starts on 430-440 MHz
+
+// Spectrum: -130..-10 dBm into 90 px (3/4 px per dB), below the 32 px header.
+const int X0 = 20, SPEC_Y = 52, SPEC_H = 90, AXIS_Y = SPEC_Y + SPEC_H + 3;
 
 // Waterfall = ILI9341 hardware vertical scroll. No pixel is ever copied: each sweep
-// writes one new 200-px row and moves the controller's scroll pointer (VSCRSADD).
-// Scrolling works on frame-memory rows, and with rotation 2 (MY set) screen row y is
-// memory row 319 - y. So, in memory rows:
+// writes one new row and moves the controller's scroll pointer (VSCRSADD). Scrolling
+// works on frame-memory rows, and with rotation 2 (MY set) screen row y is memory row
+// 319 - y. So, in memory rows:
 //   TFA = the tabs strip at the screen bottom, VSA = the waterfall, BFA = everything above.
 const int WF_Y = 158, WF_H = 124;
 const int TFA = 320 - WF_Y - WF_H, VSA = WF_H, BFA = WF_Y;
@@ -916,42 +1048,18 @@ const int TFA = 320 - WF_Y - WF_H, VSA = WF_H, BFA = WF_Y;
 // flips where the scroll areas sit, so drop both while sweeping: same picture, one layout.
 const uint8_t MADCTL_SWEEP = 0xC8, MADCTL_ROT2 = 0xDC;   // MY|MX|BGR (+ML|MH)
 
-int16_t bins[SWEEP_BINS], hold[SWEEP_BINS];
+int16_t px[NPX], hold[NPX];
+int16_t mv[600];                         // this sweep's points: dBm ...
+uint16_t mg[600];                        // ... at grid bins
 uint16_t pal[64];
 int floorDbm = -120, vsp = TFA, wfRow;   // wfRow = memory row being drawn this sweep
 uint32_t sweepCount, shownTotal;
-// The sweep runs the radio in FSK mode: its RSSI is smoothed over just 2 samples and the
-// receiver can be relocked onto a new frequency with one register write, so a reading is
-// valid ~0.2 ms after a retune. LoRa mode's RSSI is averaged far longer, which smeared
-// signals a few bins late and read them low.
-const uint8_t RX_CFG = 0x08;             // RegRxConfig: AGC on, AFC off, no trigger
 
 inline int specH(int dbm) { int v = (dbm + 130) * 3 / 4; return v < 0 ? 0 : v > SPEC_H ? SPEC_H : v; }
-inline int binKHz(int i) { return 430000 + i * 50; }
-
-// ---- radio, raw SPI. RadioLib's setFrequency()/startReceive() verify every register
-// they touch (~1.4 ms per step); a sweep only needs 4 writes and 1 read.
-SPISettings fastSPI(8000000, MSBFIRST, SPI_MODE0);
-inline void rw(uint8_t reg, uint8_t val) {
-  digitalWrite(PIN_NSS, LOW); radioSPI.transfer16((reg | 0x80) << 8 | val); digitalWrite(PIN_NSS, HIGH);
-}
-inline uint8_t rr(uint8_t reg) {
-  digitalWrite(PIN_NSS, LOW); uint8_t v = radioSPI.transfer16(reg << 8); digitalWrite(PIN_NSS, HIGH);
-  return v;
-}
-void retune(int i) {
-  uint32_t frf = (uint64_t)binKHz(i) * 524288 / 32000;   // f * 2^19 / 32 MHz
-  radioSPI.beginTransaction(fastSPI);
-  rw(0x06, frf >> 16); rw(0x07, frf >> 8); rw(0x08, frf);
-  rw(0x0D, RX_CFG | 0x20);                // RestartRxWithPllLock: relock on the new frequency
-  radioSPI.endTransaction();
-}
-int rssi() {   // FSK RegRssiValue = -2 x dBm
-  radioSPI.beginTransaction(fastSPI);
-  int v = -(rr(0x11) >> 1);
-  radioSPI.endTransaction();
-  return v;
-}
+int npx() { return min(NPX, (GBINS - vStart + bpp - 1) / bpp); }
+int subs() { return (bpp + 4) / 5; }      // points per pixel: each covers <= 250 kHz
+int pointBin(int x, int s) { return min(GBINS - 1, vStart + x * bpp + s * bpp / subs() + bpp / subs() / 2); }
+uint8_t bw() { return bpp == 1 ? rf::BW_62 : bpp == 2 ? rf::BW_125 : rf::BW_250; }
 
 // ---- display, raw ILI9341 commands
 void lcdCmd(uint8_t c, const uint16_t *d, int n) {
@@ -973,49 +1081,82 @@ void buildPalette() {
   }
 }
 
-// Draw bin i straight to the screen: spectrum column, max-hold dot, floor dash and
-// this sweep's waterfall pixel. ~4 tiny writes, done while the next bin settles.
-void drawBin(int i) {
-  int x = X0 + i, h = specH(bins[i]), y0 = SPEC_Y + SPEC_H;
+// Draw pixel x straight to the screen: spectrum column, max-hold dot, floor dash and
+// this sweep's waterfall pixel. ~4 tiny writes, done while the next point settles.
+void drawPx(int i) {
+  int x = X0 + i, h = specH(px[i]), y0 = SPEC_Y + SPEC_H;
   lcd.drawFastVLine(x, SPEC_Y, SPEC_H - h, C_BG);
-  lcd.drawFastVLine(x, y0 - h, h, snrColor(bins[i] - floorDbm));
+  lcd.drawFastVLine(x, y0 - h, h, snrColor(px[i] - floorDbm));
   lcd.drawPixel(x, y0 - 1 - specH(hold[i]), C_TEXT);
   if (i % 6 < 3) lcd.drawPixel(x, y0 - 1 - specH(floorDbm), C_ACCENT);
-  int k = (bins[i] - floorDbm) * 63 / 40;
+  int k = (px[i] - floorDbm) * 63 / 40;
   lcd.drawPixel(x, 319 - wfRow, pal[k < 0 ? 0 : k > 63 ? 63 : k]);
 }
 
-// Header: the mode and the detections logged so far; its button goes to METER.
-void title() {
-  shownTotal = detlog::total;
-  char s[32];
-  snprintf(s, sizeof s, sdOk ? "SWEEP  %lu logged" : "SWEEP  %lu, no SD", (unsigned long)shownTotal);
-  uiHeader(s, "Meter");
-}
-
-void enter() {
-  radio.beginFSK(430.0, 4.8, 5.0, SWEEP_BW_KHZ);
-  radio.startReceive();
-  radioSPI.beginTransaction(fastSPI);
-  rw(0x0E, 0x00);                         // RegRssiConfig: no offset, smoothing 2 samples
-  rw(0x0D, RX_CFG);
-  radioSPI.endTransaction();
-
-  for (int i = 0; i < SWEEP_BINS; i++) hold[i] = -130;
-  sweepCount = 0;
-
-  lcd.fillScreen(C_BG);
-  title();
+// MHz labels for the current view, every 50 px.
+void drawAxis() {
+  lcd.fillRect(X0 - 8, AXIS_Y - 2, NPX + 16, WF_Y - AXIS_Y + 2, C_BG);
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(C_DIM, C_BG);
   lcd.setTextDatum(top_center);
   char b[8];
-  for (int i = 0; i <= SWEEP_BINS; i += 50) {   // MHz axis
-    int x = X0 + (i < SWEEP_BINS ? i : SWEEP_BINS - 1);
-    lcd.drawFastVLine(x, AXIS_Y - 2, 3, C_DIM);
-    snprintf(b, sizeof b, "%d.%d", binKHz(i) / 1000, binKHz(i) % 1000 / 100);
-    lcd.drawString(b, x, AXIS_Y + 2);
+  const int n = npx();
+  for (int x = 0; x < n + 50; x += 50) {
+    int xx = x < n ? x : n - 1, khz = gKHz(vStart + xx * bpp);
+    if (x >= n && n - 1 - (x - 50) < 30) break;     // too close to the previous label
+    lcd.drawFastVLine(X0 + xx, AXIS_Y - 2, 3, C_DIM);
+    if (bpp == 1) snprintf(b, sizeof b, "%d.%d", khz / 1000, khz % 1000 / 100);
+    else snprintf(b, sizeof b, "%d", khz / 1000);
+    lcd.drawString(b, X0 + xx, AXIS_Y + 2);
   }
+}
+
+// Header: the mode and the detections logged so far; its button opens the RX menu.
+void title() {
+  shownTotal = detlog::total;
+  char s[32];
+  snprintf(s, sizeof s, sdOk ? "SWEEP  %lu logged" : "SWEEP  %lu, no SD", (unsigned long)shownTotal);
+  uiHeader(s, "Menu");
+}
+
+// Moves the window (clamped to the grid) and starts its picture afresh.
+void setView(int start, int zoom) {
+  bpp = zoom;
+  vStart = constrain(start, 0, max(0, GBINS - NPX * bpp));
+  detlog::closeAll();
+  for (int i = 0; i < NPX; i++) hold[i] = px[i] = -130;
+  rf::setBw(bw());
+  lcd.fillRect(X0, SPEC_Y, NPX, SPEC_H, C_BG);
+  lcd.fillRect(X0, WF_Y, NPX, WF_H, C_BG);        // every waterfall row, wherever it scrolled
+  drawAxis();
+  int a = gKHz(vStart), b = gKHz(vStart + npx() * bpp);
+  Serial.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
+                b / 1000, b % 1000 / 10, bpp * G_STEP);
+}
+// A band from the menu: the closest zoom that holds it, centered.
+void setBand(int loKHz, int hiKHz) {
+  int z = ZOOMS[NZOOM - 1];
+  for (int i = 0; i < NZOOM; i++)
+    if (NPX * ZOOMS[i] * G_STEP >= hiKHz - loKHz) { z = ZOOMS[i]; break; }
+  bpp = z;
+  vStart = ((loKHz + hiKHz) / 2 - G0_KHZ) / G_STEP - NPX * z / 2;   // setView clamps it on entry
+}
+// Tap on the axis: one zoom step in around that spot; from the closest, the full range.
+void zoomAt(int sx) {
+  int center = vStart + constrain(sx - X0, 0, NPX - 1) * bpp;
+  int z = 0;
+  while (z < NZOOM && ZOOMS[z] != bpp) z++;
+  int nb = z <= 0 ? ZOOMS[NZOOM - 1] : ZOOMS[z - 1];
+  setView(nb == ZOOMS[NZOOM - 1] ? 0 : center - NPX * nb / 2, nb);
+}
+
+void enter() {
+  rf::startRx(bw());
+  sweepCount = 0;
+  lcd.fillScreen(C_BG);
+  title();
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(C_DIM, C_BG);
   lcd.setTextDatum(middle_right);                // dBm labels
   for (int d = -110; d <= -30; d += 40) lcd.drawNumber(d, X0 - 2, SPEC_Y + SPEC_H - 1 - specH(d));
   drawTabs(0);                                   // SWEEP is under RX
@@ -1025,95 +1166,376 @@ void enter() {
   lcdCmd(0x33, def, 3);                          // VSCRDEF
   vsp = TFA;
   scrollTo(vsp);
-  Serial.printf("SWEEP 430.00-439.95 MHz, %d bins, 50 kHz step, dwell %lu us\n",
-                SWEEP_BINS, (unsigned long)SWEEP_DWELL_US);
+  setView(vStart, bpp);
 }
 
 void leave() {
+  detlog::closeAll();
   scrollTo(0);
   lcd.startWrite(); lcd.writeCommand(0x13); lcd.endWrite();   // NORON: back to normal mode
   lcdMadctl(MADCTL_ROT2);
   radio.begin(METER_FREQ_MHZ);                                 // back to LoRa for the meter
 }
 
-// One sweep per call. Each bin's drawing happens while the next bin settles, so the
-// screen updates continuously. Returns false early on a tab tap or BOOT.
-bool loop() {
+// One sweep per call. Each pixel's drawing happens while the next point settles, so the
+// screen updates continuously. Returns early on a tap, a drag or BOOT.
+void loop() {
+  if (pendingDrag.valid) {                       // drag: the picture follows the finger
+    pendingDrag.valid = false;
+    if (pendingDrag.y0 >= SPEC_Y && pendingDrag.y0 < TAB_Y && bpp < ZOOMS[NZOOM - 1])
+      setView(vStart - pendingDrag.dx * bpp, bpp);
+    return;
+  }
+  if (tapped()) {
+    int x = pendingTap.x, y = pendingTap.y;
+    if (y >= AXIS_Y - 6 && y < WF_Y) zoomAt(x);
+    else if (y >= SPEC_Y) for (int i = 0; i < NPX; i++) hold[i] = px[i];
+    return;
+  }
   uint32_t t0 = millis();
   // New waterfall row: advance the scroll pointer, then the row that just wrapped to
   // the top (the oldest one) is the one to overwrite. Blank it first.
   wfRow = vsp;
   vsp = TFA + (vsp - TFA + 1) % VSA;
-  lcd.drawFastHLine(X0, 319 - wfRow, SWEEP_BINS, C_BG);
+  lcd.drawFastHLine(X0, 319 - wfRow, NPX, C_BG);
   scrollTo(vsp);
-  retune(0);                     // 439.95 -> 430.00 is a 10 MHz jump: give the PLL 1 ms
+  const int nx = npx(), ns = subs();
+  rf::tune(gKHz(pointBin(0, 0)));                // the jump back to the start: 1 ms for the PLL
   delayMicroseconds(1000);
 
-  for (int i = 0; i < SWEEP_BINS; i++) {
-    uint32_t t = micros();
-    retune(i);
-    if (i) drawBin(i - 1);
-    while (micros() - t < SWEEP_DWELL_US) {}
-    bins[i] = rssi();
-    if (bins[i] > hold[i]) hold[i] = bins[i];
-    if (i % 25 == 0) {
+  int n = 0;
+  for (int x = 0; x < nx; x++) {
+    int best = -200;
+    for (int s = 0; s < ns; s++) {
+      uint32_t t = micros();
+      int g = pointBin(x, s);
+      rf::tune(gKHz(g));
+      if (x && !s) drawPx(x - 1);
+      while (micros() - t < SWEEP_DWELL_US) {}
+      int v = rf::rssi();
+      mv[n] = v; mg[n++] = g;
+      if (v > best) best = v;
+    }
+    px[x] = best;
+    if (best > hold[x]) hold[x] = best;
+    if (x % 25 == 0) {
       pollTouch();
-      if (tapIsOnTabs() || digitalRead(PIN_BOOT) == LOW) return false;
+      if (pendingTap.valid || pendingDrag.valid || digitalRead(PIN_BOOT) == LOW) return;
     }
   }
-  drawBin(SWEEP_BINS - 1);
+  drawPx(nx - 1);
   uint32_t dt = millis() - t0;
 
-  // Floor for the next sweep: 25th percentile, by counting (bins are whole dB).
-  uint8_t cnt[136] = {0};
-  int peak = 0;
-  for (int i = 0; i < SWEEP_BINS; i++) {
-    int v = bins[i] + 140; cnt[v < 0 ? 0 : v > 135 ? 135 : v]++;
-    if (bins[i] > bins[peak]) peak = i;
-  }
-  for (int v = 0, n = 0; v < 136; v++) if ((n += cnt[v]) >= SWEEP_BINS / 4) { floorDbm = v - 140; break; }
-
-  int top = 135;                          // noise top: 95th percentile, 10th-loudest bin
-  for (int n = 0; top > 0 && (n += cnt[top]) < SWEEP_BINS / 20; top--) {}
-  top -= 140;
-  detlog::scan(bins, detlog::SPUR_BIN, floorDbm, top, t0);
+  int top;
+  rf::levels(mv, n, floorDbm, top);
+  detlog::scan(mv, mg, n, floorDbm, top, t0);
   if (detlog::total != shownTotal) title();
 
-  if (tapped()) for (int i = 0; i < SWEEP_BINS; i++) hold[i] = bins[i];
-
+  int peak = 0;
+  for (int k = 1; k < n; k++) if (mv[k] > mv[peak]) peak = k;
   char b[40];
-  int snr = bins[peak] - floorDbm;
+  int snr = mv[peak] - floorDbm, khz = gKHz(mg[peak]);
   lcd.setFont(&fonts::Font2);
   lcd.setTextDatum(top_left);
   lcd.setTextPadding(SCR_W - 16);
   lcd.setTextColor(snr >= 6 ? snrColor(snr) : C_DIM, C_BG);
-  snprintf(b, sizeof b, "Peak %d.%02d MHz  %d dBm", binKHz(peak) / 1000, binKHz(peak) % 1000 / 10, bins[peak]);
+  snprintf(b, sizeof b, "Peak %d.%02d MHz  %d dBm", khz / 1000, khz % 1000 / 10, mv[peak]);
   lcd.drawString(b, 8, UI_HDR_H + 3);
   lcd.setTextPadding(0);
 
   if (++sweepCount % 10 == 0)
     Serial.printf("SWEEP %lu ms  floor %d  top %d dBm  hot %d  spurs %d  peak %s\n",
                   (unsigned long)dt, floorDbm, top, detlog::hot, detlog::spurs, b + 5);
-  return true;
 }
 
 }  // namespace sweep
 
+// ================================================================ SCAN
+// A scanner over the whole grid. Scanning: full-range sweeps (250 kHz receiver, a point
+// every 200 kHz, ~7 a second) with a small spectrum. A point ON_DB over the sweep's
+// noise top that isn't a spur or locked out is checked up close: 62.5 kHz receiver,
+// every 50 kHz bin within +-300 kHz, plus the local floor from points 0.6-1.4 MHz either
+// side. If its best bin is LOCK_DB over that floor, the scanner locks on: it parks there
+// and samples ~1000 times a second. Each 50 ms window with a sample over the line counts
+// as heard. After HANG_MS without one it logs the signal (start, frequency, peak,
+// duration) and scans on, skipping that frequency for SKIP_MS. After MAX_LOCK_MS it logs,
+// locks the frequency out for LOCKOUT_MS and moves on; a tap does the same (Skip).
+namespace scan {
+
+const int LOCK_DB = 10;
+const uint32_t HANG_MS = 2000, MAX_LOCK_MS = 60000, SKIP_MS = 10000, LOCKOUT_MS = 300000;
+const int BPP = 12, NX = (GBINS + BPP - 1) / BPP, SUBS = 3;   // full range, 192 px
+const int X0 = 24, SP_Y = 150, SP_H = 44, AX_Y = SP_Y + SP_H + 2, HIT_Y = 212;
+
+bool locked;
+int lockG, lockFloor, peak, level;
+uint32_t tStart, tLast, tShown;
+uint16_t hits;
+int16_t mv[NX * SUBS];
+uint16_t mg[NX * SUBS];
+struct Skip { int16_t g; uint32_t until; } skips[8];
+uint32_t shownTotal;
+
+bool skipped(int g) {
+  for (auto &s : skips) if (s.until && (int32_t)(s.until - millis()) > 0 && abs(g - s.g) <= 2) return true;
+  return false;
+}
+void skip(int g, uint32_t ms) {
+  int o = 0;                                     // the slot that frees up first
+  for (int i = 1; i < 8; i++) if ((int32_t)(skips[i].until - skips[o].until) < 0) o = i;
+  skips[o] = {(int16_t)g, millis() + ms};
+}
+
+void title() {
+  shownTotal = detlog::total;
+  char s[32];
+  snprintf(s, sizeof s, sdOk ? "SCAN  %lu logged" : "SCAN  %lu, no SD", (unsigned long)shownTotal);
+  uiHeader(s, "Menu");
+}
+
+void status(const char *s, uint16_t c) {
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(top_left);
+  lcd.setTextColor(c, C_BG);
+  lcd.setTextPadding(SCR_W - 16);
+  lcd.drawString(s, 8, UI_HDR_H + 4);
+  lcd.setTextPadding(0);
+}
+
+void bigFreq(int khz, uint16_t c) {
+  char b[12];
+  if (khz) snprintf(b, sizeof b, "%d.%03d", khz / 1000, khz % 1000);
+  else snprintf(b, sizeof b, "---.---");
+  lcd.setFont(&fonts::Font7);
+  lcd.setTextDatum(top_center);
+  lcd.setTextColor(c, C_BG);
+  lcd.setTextPadding(SCR_W - 4);
+  lcd.drawString(b, SCR_W / 2, 56);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+
+// Level bar: the signal against the locked frequency's floor, dBm on the right.
+void bar(int dbm) {
+  const int x = 8, y = 112, w = 170, h = 14;
+  lcd.fillRect(x, y, w, h, C_GRID);
+  if (dbm > -140) {
+    int f = constrain((dbm + 130) * w / 120, 0, w);
+    lcd.fillRect(x, y, f, h, snrColor(dbm - lockFloor));
+  }
+  char b[12];
+  snprintf(b, sizeof b, dbm > -140 ? "%d dBm" : "", dbm);
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(middle_right);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextPadding(56);
+  lcd.drawString(b, SCR_W - 6, y + h / 2);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+
+// The last few detections (SWEEP and SCAN), newest first: time, MHz, dBm, seconds.
+void drawHits() {
+  lcd.fillRect(0, HIT_Y, SCR_W, TAB_Y - HIT_Y, C_BG);
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(top_left);
+  for (int i = 0; i < detlog::nRecent; i++) {
+    const detlog::Det &d = detlog::recent[i];
+    char t[28], b[48];
+    detlog::utc(t, d.t0);
+    if (*t) memmove(t, t + 11, 9);               // HH:MM:SS of the UTC stamp
+    else snprintf(t, sizeof t, "+%lus", (unsigned long)(d.t0 / 1000));
+    int khz = gKHz(d.bin);
+    snprintf(b, sizeof b, "%.8s  %d.%03d  %d dBm  %lu.%lus", t, khz / 1000, khz % 1000, d.peak,
+             (unsigned long)((d.t1 - d.t0) / 1000), (unsigned long)((d.t1 - d.t0) % 1000 / 100));
+    lcd.setTextColor(i ? C_DIM : C_TEXT, C_BG);
+    lcd.drawString(b, 8, HIT_Y + i * 18);
+  }
+}
+
+void drawStatic() {
+  lcd.fillScreen(C_BG);
+  title();
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.setTextDatum(top_center);
+  for (int mhz = 410; mhz <= 520; mhz += 30) {
+    int x = X0 + (mhz * 1000 - G0_KHZ) / G_STEP / BPP;
+    lcd.drawFastVLine(x, AX_Y, 3, C_DIM);
+    lcd.drawNumber(mhz, x, AX_Y + 4);
+  }
+  bigFreq(0, C_DIM);
+  bar(-200);
+  drawHits();
+  drawTabs(0);                                   // SCAN is under RX
+}
+
+void startScan() {
+  locked = false;
+  rf::setBw(rf::BW_250);
+  status("Scanning 410 - 525 MHz", C_DIM);
+  bigFreq(0, C_DIM);
+  bar(-200);
+}
+
+// Up-close check of grid bin g0: local floor and the loudest bin near it.
+bool check(int g0) {
+  rf::setBw(rf::BW_62);
+  int16_t ref[16];
+  for (int j = 0; j < 16; j++) {
+    int g = constrain(g0 + (j < 8 ? -12 - j * 2 : 12 + (j - 8) * 2), 0, GBINS - 1);
+    rf::tune(gKHz(g));
+    delayMicroseconds(j ? 250 : 1000);
+    ref[j] = rf::rssi();
+  }
+  int fl, tp;
+  rf::levels(ref, 16, fl, tp);
+  int best = -200, bestG = g0;
+  for (int g = max(0, g0 - 6); g <= min(GBINS - 1, g0 + 6); g++) {
+    if (detlog::isSpur(g)) continue;
+    rf::tune(gKHz(g));
+    delayMicroseconds(g == max(0, g0 - 6) ? 1000 : 250);
+    int v = rf::rssi();
+    if (v > best) { best = v; bestG = g; }
+  }
+  if (best < fl + LOCK_DB) { rf::setBw(rf::BW_250); return false; }
+  lockG = bestG; lockFloor = fl; peak = level = best;
+  rf::tune(gKHz(lockG));
+  return true;
+}
+
+void endLock(bool longOut) {
+  detlog::Det d = {tStart, tLast, (int16_t)lockG, (int16_t)lockG, (int16_t)peak,
+                   (int16_t)(peak - lockFloor), hits, 0, true, detlog::SRC_SCAN};
+  detlog::emit(d);
+  skip(lockG, longOut ? LOCKOUT_MS : SKIP_MS);
+  if (detlog::total != shownTotal) title();
+  drawHits();
+  startScan();
+}
+
+void enter() {
+  rf::startRx(rf::BW_250);
+  drawStatic();
+  startScan();
+  Serial.println("SCAN 410.00-524.95 MHz");
+}
+
+void leave() {
+  if (locked) endLock(false);
+  radio.begin(METER_FREQ_MHZ);                   // back to LoRa for the meter
+}
+
+void sweepOnce() {
+  rf::tune(gKHz(SUBS / 2 * BPP / SUBS));
+  delayMicroseconds(1000);
+  int n = 0;
+  for (int x = 0; x < NX; x++) {
+    int best = -200;
+    for (int s = 0; s < SUBS; s++) {
+      int g = min(GBINS - 1, x * BPP + s * BPP / SUBS + BPP / SUBS / 2);
+      uint32_t t = micros();
+      rf::tune(gKHz(g));
+      if (x && !s) {                             // draw the previous pixel while this settles
+        int v = mv[n - 1];
+        for (int k = 2; k <= SUBS; k++) v = max(v, (int)mv[n - k]);
+        int h = constrain((v + 130) * SP_H / 120, 0, SP_H);
+        lcd.drawFastVLine(X0 + x - 1, SP_Y, SP_H - h, C_BG);
+        lcd.drawFastVLine(X0 + x - 1, SP_Y + SP_H - h, h, C_ACCENT);
+      }
+      while (micros() - t < SWEEP_DWELL_US) {}
+      mv[n] = rf::rssi(); mg[n++] = g;
+      if (mv[n - 1] > best) best = mv[n - 1];
+    }
+    if (x % 32 == 0) {
+      pollTouch();
+      if (pendingTap.valid || digitalRead(PIN_BOOT) == LOW) return;
+    }
+  }
+  int fl, tp;
+  rf::levels(mv, n, fl, tp);
+  detlog::learn(mv, mg, n, tp + detlog::OFF_DB);
+  int c = -1;                                    // the loudest candidate
+  for (int k = 0; k < n; k++)
+    if (mv[k] >= tp + detlog::ON_DB && (c < 0 || mv[k] > mv[c]) && !detlog::isSpur(mg[k]) && !skipped(mg[k]))
+      c = k;
+  if (c >= 0 && check(mg[c])) {
+    locked = true;
+    tStart = tLast = tShown = millis();
+    hits = 1;
+    int khz = gKHz(lockG);
+    Serial.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
+    bigFreq(khz, C_TEXT);
+    status("LOCKED   tap to skip", C_ALERT);
+  }
+}
+
+// Locked: one 50 ms window of samples per call.
+void listen() {
+  uint32_t t0 = millis();
+  int best = -200;
+  while (millis() - t0 < 50) {
+    int v = rf::rssi();
+    if (v > best) best = v;
+    delayMicroseconds(900);
+  }
+  uint32_t now = millis();
+  if (best >= lockFloor + LOCK_DB) { tLast = now; hits++; if (best > peak) peak = best; }
+  bar(best);
+  char s[40];
+  snprintf(s, sizeof s, "LOCKED  %lu.%lus  quiet %lu.%lus", (unsigned long)((now - tStart) / 1000),
+           (unsigned long)((now - tStart) % 1000 / 100), (unsigned long)((now - tLast) / 1000),
+           (unsigned long)((now - tLast) % 1000 / 100));
+  status(s, now - tLast < 200 ? C_ALERT : C_TEXT);
+  if (now - tLast > HANG_MS) endLock(false);
+  else if (now - tStart > MAX_LOCK_MS) endLock(true);
+}
+
+void loop() {
+  if (tapped()) {                                // tap while locked: skip this one
+    if (locked) { Serial.println("SCAN skip"); endLock(true); }
+    return;
+  }
+  pendingDrag.valid = false;
+  if (locked) listen(); else sweepOnce();
+}
+
+}  // namespace scan
+
 // ================================================================ TX
-// Test transmitter: a plain carrier, or a 1 kHz FM tone. The SX1278 has no audio input,
-// so the tone is made in software: the radio sends a carrier (FSK continuous mode, zero
-// deviation) and the frequency registers are rewritten along a 16-step sine, 16 times
-// per tone cycle - +-3 kHz at 1 kHz, which an FM receiver plays as a tone.
+// Test transmitter: a plain carrier, a 1 kHz FM tone, or a 5 s chiptune. The SX1278 has
+// no audio input, so the audio is made in software: the radio sends a carrier (FSK
+// continuous mode, zero deviation) and the firmware keeps rewriting its frequency
+// registers. The tone follows a 16-step sine (+-3 kHz, 16 writes per cycle); the
+// chiptune flips between two frequencies (+-2.5 kHz) at the note's pitch - square-wave
+// FM, which an FM receiver plays as an 8-bit pulse voice. Chords are arpeggios: the
+// notes of the chord taken in turn every ~33 ms, the old trick for one voice.
 // Settings are kept in NVS. A tap or BOOT stops a transmission early.
 namespace tx {
 
 const int POWERS[] = {2, 5, 10, 14, 17};          // dBm out of PA_BOOST
 const int LENGTHS_MS[] = {500, 1000, 2000, 5000};
 const int F_MIN = 430000, F_MAX = 439995;         // kHz
-int fKHz = 433500, powIdx = 0, sig = 1, lenIdx = 1, sel = -1;   // sig: 0 carrier, 1 tone
+enum { SIG_CARRIER, SIG_TONE, SIG_SONG, NUM_SIG };
+int fKHz = 433500, powIdx = 0, sig = SIG_TONE, lenIdx = 1, sel = -1;
 
 // 3 kHz deviation in FRF steps (32 MHz / 2^19 = 61.035 Hz): 49 x sin(k x 22.5 deg)
 const int8_t SIN16[16] = {0, 19, 35, 45, 49, 45, 35, 19, 0, -19, -35, -45, -49, -45, -35, -19};
+const int SONG_DEV = 41;                          // +-2.5 kHz for the chiptune
+
+// ---- the chiptune: an original 5 s tune, 150 BPM, one step = a 16th note = 100 ms.
+// note = MIDI number (60 = middle C, 0 = rest), len in steps, arp: 0 none, 1 major, 2 minor
+struct Step { uint8_t note, len, arp; };
+const Step SONG[] = {
+  {72, 2, 0}, {76, 2, 0}, {79, 2, 0}, {84, 2, 0}, {83, 1, 0}, {79, 1, 0}, {76, 2, 0}, {77, 2, 0}, {81, 2, 0},
+  {79, 3, 0}, {76, 1, 0}, {74, 2, 0}, {72, 2, 0}, {74, 1, 0}, {76, 1, 0}, {79, 2, 0}, {81, 4, 2},
+  {60, 4, 1}, {65, 4, 1}, {67, 4, 1},
+  {72, 6, 1},
+};
+const int STEP_MS = 100, GAP_MS = 12;             // a short gap ends each note: staccato
+// Half a period in us for C4..B4; each octave up halves it.
+const uint16_t HALF_US4[12] = {1911, 1804, 1703, 1607, 1517, 1432, 1351, 1276, 1204, 1136, 1073, 1012};
+uint32_t halfUs(int midi) { return HALF_US4[midi % 12] >> (midi / 12 - 5) ; }   // midi >= 60
 
 const int ROW_X = 6, ROW_W = SCR_W - 12, ROW_Y = UI_HDR_H + 6, ROW_H = 36, ROW_P = 42;
 const int TX_Y = ROW_Y + 4 * ROW_P + 4, TX_H = 50;      // TRANSMIT button
@@ -1123,7 +1545,7 @@ const char *const LABELS[4] = {"Frequency", "Power", "Signal", "Length"};
 void load() {
   fKHz = constrain((int)prefs.getUInt("txf", fKHz), F_MIN, F_MAX);
   powIdx = prefs.getUChar("txp", powIdx) % 5;
-  sig = prefs.getUChar("txs", sig) & 1;
+  sig = prefs.getUChar("txs", sig) % NUM_SIG;
   lenIdx = prefs.getUChar("txl", lenIdx) % 4;
 }
 void save() {
@@ -1131,16 +1553,22 @@ void save() {
   prefs.putUChar("txs", sig); prefs.putUChar("txl", lenIdx);
 }
 
+int songMs() { int n = 0; for (auto &s : SONG) n += s.len; return n * STEP_MS; }
+
 void value(int r, char *s, int n) {
+  static const char *const SIGS[NUM_SIG] = {"Carrier", "Tone 1 kHz", "Chiptune"};
   switch (r) {
     case 0: snprintf(s, n, "%d.%03d MHz", fKHz / 1000, fKHz % 1000); break;
     case 1: snprintf(s, n, "%d dBm", POWERS[powIdx]); break;
-    case 2: snprintf(s, n, sig ? "Tone 1 kHz" : "Carrier"); break;
-    default: snprintf(s, n, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100); break;
+    case 2: snprintf(s, n, "%s", SIGS[sig]); break;
+    default:
+      if (sig == SIG_SONG) snprintf(s, n, "%d.%d s (song)", songMs() / 1000, songMs() % 1000 / 100);
+      else snprintf(s, n, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100);
+      break;
   }
 }
 void drawRow(int r) {
-  char v[16];
+  char v[20];
   value(r, v, sizeof v);
   int y = ROW_Y + r * ROW_P;
   uiRow(ROW_X, y, ROW_W, ROW_H, LABELS[r], v, r == sel);
@@ -1162,7 +1590,7 @@ void status(const char *s, uint16_t c) {
 void drawAll() {
   glowOff();
   lcd.fillScreen(C_BG);
-  uiHeader("TX  test transmitter");
+  uiHeader("TX", "Menu");
   for (int r = 0; r < 4; r++) drawRow(r);
   drawButton(false);
   status("Tap a row to change it", C_DIM);
@@ -1199,13 +1627,11 @@ void pickFreq() {
     lcd.setTextDatum(top_left);
   };
   drawValue();
-  pendingTap.valid = false;
+  int x, y;
+  while (takeTap(x, y)) {}
   while (true) {
     uiTick();
-    pollTouch();
-    if (!pendingTap.valid) { delay(10); continue; }
-    pendingTap.valid = false;
-    int x = pendingTap.x, y = pendingTap.y;
+    if (!takeTap(x, y)) { delay(10); continue; }
     if (uiHeaderButtonHit(x, y)) return;                   // Back: keep the old value
     if (y >= oky && y < oky + 38) { fKHz = v; save(); return; }
     int col = (x - 8) / (bw + 8), row = (y - by) / (bh + 8);
@@ -1216,50 +1642,88 @@ void pickFreq() {
   }
 }
 
-void send() {
-  const int ms = LENGTHS_MS[lenIdx], dbm = POWERS[powIdx];
-  Serial.printf("TX %d.%03d MHz  %d dBm  %s  %d ms\n", fKHz / 1000, fKHz % 1000, dbm,
-                sig ? "tone 1 kHz" : "carrier", ms);
+// ---- sending
+uint32_t frf0;                                            // the carrier, in FRF steps
+inline void setFrf(uint32_t f) {
+  radioSPI.beginTransaction(rf::fastSPI);
+  rf::rw(0x06, f >> 16); rf::rw(0x07, f >> 8); rf::rw(0x08, f);
+  radioSPI.endTransaction();
+}
+// Stop on BOOT, or on a new touch (the finger that started it must lift first).
+bool armed;
+bool stopNow() {
+  bool pen = digitalRead(PIN_TP_IRQ) == LOW;
+  if (!pen) armed = true;
+  return (armed && pen) || digitalRead(PIN_BOOT) == LOW;
+}
+// Square-wave FM at the note's pitch for ms (a rest holds the carrier). False = stopped.
+bool playNote(int midi, int arp, uint32_t ms) {
+  static const int8_t ARP[3][3] = {{0, 0, 0}, {0, 4, 7}, {0, 3, 7}};
+  uint32_t t0 = millis(), next = micros();
+  bool hi = false;
+  int a = 0;
+  uint32_t half = midi ? halfUs(midi) : 0, aAt = t0;
+  while (millis() - t0 < ms) {
+    if (arp && millis() - aAt >= 33) { aAt = millis(); a = (a + 1) % 3; half = halfUs(midi + ARP[arp][a]); }
+    if (!half) { delay(1); if (stopNow()) return false; continue; }
+    while ((int32_t)(micros() - next) < 0) {}
+    next += half;
+    hi = !hi;
+    setFrf(frf0 + (hi ? SONG_DEV : -SONG_DEV));
+    if (hi && stopNow()) return false;
+  }
+  setFrf(frf0);
+  return true;
+}
+
+// Transmits signal s (SIG_*) on the current frequency and power.
+void send(int s) {
+  const int ms = s == SIG_SONG ? songMs() : LENGTHS_MS[lenIdx], dbm = POWERS[powIdx];
+  static const char *const NAMES[NUM_SIG] = {"carrier", "tone 1 kHz", "chiptune"};
+  Serial.printf("TX %d.%03d MHz  %d dBm  %s  %d ms\n", fKHz / 1000, fKHz % 1000, dbm, NAMES[s], ms);
   glowOff();
   drawButton(true);
   status("Tap or BOOT to stop", C_DIM);
-  const uint32_t frf = (uint64_t)fKHz * 524288 / 32000;  // f x 2^19 / 32 MHz
+  frf0 = (uint64_t)fKHz * 524288 / 32000;                 // f x 2^19 / 32 MHz
   radio.setFrequency(fKHz / 1000.0f);
   radio.setOutputPower(dbm);
-  radioSPI.beginTransaction(sweep::fastSPI);
-  sweep::rw(0x04, 0); sweep::rw(0x05, 0);                 // RegFdev = 0: a plain carrier
+  radioSPI.beginTransaction(rf::fastSPI);
+  rf::rw(0x04, 0); rf::rw(0x05, 0);                       // RegFdev = 0: a plain carrier
   radioSPI.endTransaction();
   radio.transmitDirect();                                 // continuous mode, PA on
 
-  // Stop on BOOT, or on a new touch (the finger that pressed TRANSMIT must lift first).
-  bool armed = false, stopped = false;
-  uint32_t t0 = millis(), next = micros();
-  for (int k = 0; millis() - t0 < (uint32_t)ms; k++) {
-    if (sig) {                                            // next sine step, every 62.5 us
-      while ((int32_t)(micros() - next) < 0) {}
-      next += 62 + (k & 1);
-      uint32_t f = frf + SIN16[k & 15];
-      radioSPI.beginTransaction(sweep::fastSPI);
-      sweep::rw(0x06, f >> 16); sweep::rw(0x07, f >> 8); sweep::rw(0x08, f);
-      radioSPI.endTransaction();
-      if (k & 15) continue;                               // buttons once per tone cycle
-    } else {
-      delay(1);
+  armed = false;
+  bool stopped = false;
+  uint32_t t0 = millis();
+  if (s == SIG_SONG) {
+    for (auto &st : SONG) {
+      uint32_t len = st.len * STEP_MS;
+      if (!playNote(st.note, st.arp, len - GAP_MS) || !playNote(0, 0, GAP_MS)) { stopped = true; break; }
     }
-    bool pen = digitalRead(PIN_TP_IRQ) == LOW;
-    if (!pen) armed = true;
-    if ((armed && pen) || digitalRead(PIN_BOOT) == LOW) { stopped = true; break; }
+  } else {
+    uint32_t next = micros();
+    for (int k = 0; millis() - t0 < (uint32_t)ms; k++) {
+      if (s == SIG_TONE) {                                // next sine step, every 62.5 us
+        while ((int32_t)(micros() - next) < 0) {}
+        next += 62 + (k & 1);
+        setFrf(frf0 + SIN16[k & 15]);
+        if (k & 15) continue;                             // buttons once per tone cycle
+      } else {
+        delay(1);
+      }
+      if (stopNow()) { stopped = true; break; }
+    }
   }
   radio.standby();
   uint32_t dt = millis() - t0;
   Serial.printf("TX done after %lu ms%s\n", (unsigned long)dt, stopped ? " (stopped)" : "");
   while (digitalRead(PIN_BOOT) == LOW) delay(10);         // don't let BOOT switch modes
   bootEvent();
-  pollTouch(); pendingTap.valid = false;                  // the stopping tap is used up
+  delay(60); pollTouch(); pendingTap.valid = pendingDrag.valid = false;   // the stopping tap
   drawButton(false);
-  char s[40];
-  snprintf(s, sizeof s, stopped ? "Stopped after %lu ms" : "Sent %lu ms", (unsigned long)dt);
-  status(s, C_TEXT);
+  char b[40];
+  snprintf(b, sizeof b, stopped ? "Stopped after %lu ms" : "Sent %lu ms", (unsigned long)dt);
+  status(b, C_TEXT);
 }
 
 void enter() {
@@ -1277,11 +1741,28 @@ void leave() {
   radio.begin(METER_FREQ_MHZ);                            // LoRa again, as METER expects
 }
 
+// The header Menu: quick actions on the current frequency and power.
+void menu() {
+  static const char *const L[] = {"Play chiptune", "Send 1 kHz tone", "Send carrier", "Frequency", "Power"};
+  char f[16], p[12], song[12], len[12];
+  snprintf(f, sizeof f, "%d.%03d", fKHz / 1000, fKHz % 1000);
+  snprintf(p, sizeof p, "%d dBm", POWERS[powIdx]);
+  snprintf(song, sizeof song, "%d s", songMs() / 1000);
+  snprintf(len, sizeof len, "%d.%d s", LENGTHS_MS[lenIdx] / 1000, LENGTHS_MS[lenIdx] % 1000 / 100);
+  const char *V[] = {song, len, len, f, p};
+  int c = uiList("TX menu", L, V, 5, takeTap);
+  sel = -1;
+  if (c == 3) pickFreq();
+  if (c == 4) { powIdx = (powIdx + 1) % 5; save(); }
+  drawAll();
+  if (c >= 0 && c <= 2) send(c == 0 ? SIG_SONG : c == 1 ? SIG_TONE : SIG_CARRIER);
+}
+
 void loop() {
+  pendingDrag.valid = false;
   if (!tapped()) return;
-  int x = pendingTap.x, y = pendingTap.y;
-  (void)x;
-  if (y >= TX_Y && y < TX_Y + TX_H) { send(); return; }
+  int y = pendingTap.y;
+  if (y >= TX_Y && y < TX_Y + TX_H) { send(sig); return; }
   int r = (y - ROW_Y) / ROW_P;
   if (y < ROW_Y || r > 3 || (y - ROW_Y) % ROW_P >= ROW_H) return;
   int was = sel;
@@ -1289,28 +1770,54 @@ void loop() {
   switch (r) {
     case 0: pickFreq(); drawAll(); return;
     case 1: powIdx = (powIdx + 1) % 5; break;
-    case 2: sig ^= 1; break;
+    case 2: sig = (sig + 1) % NUM_SIG; break;
     default: lenIdx = (lenIdx + 1) % 4; break;
   }
   save();
   glowOff();
   if (was >= 0 && was != r) drawRow(was);
   drawRow(r);
+  if (r == 2) drawRow(3);                                 // Length follows the signal
 }
 
 }  // namespace tx
 
 // ================================================================ main
-// Tabs: RX (METER or SWEEP, whichever was last) and TX.
-enum Mode { MODE_METER, MODE_SWEEP, MODE_TX };
+// Tabs: RX (METER, SWEEP or SCAN, whichever was last) and TX.
+enum Mode { MODE_METER, MODE_SWEEP, MODE_SCAN, MODE_TX };
 static Mode mode = MODE_METER, rxMode = MODE_METER;
 
-static void switchMode(Mode m) {
-  if (m == mode) return;
-  if (mode == MODE_METER) meter::leave(); else if (mode == MODE_SWEEP) sweep::leave(); else tx::leave();
+static void leaveMode(Mode m) {
+  if (m == MODE_METER) meter::leave(); else if (m == MODE_SWEEP) sweep::leave();
+  else if (m == MODE_SCAN) scan::leave(); else tx::leave();
+}
+static void enterMode(Mode m) {
+  pendingTap.valid = pendingDrag.valid = false;   // nothing carries over from the last screen
   mode = m;
   if (m != MODE_TX) rxMode = m;
-  if (m == MODE_METER) meter::enter(); else if (m == MODE_SWEEP) sweep::enter(); else tx::enter();
+  if (m == MODE_METER) meter::enter(); else if (m == MODE_SWEEP) sweep::enter();
+  else if (m == MODE_SCAN) scan::enter(); else tx::enter();
+}
+static void switchMode(Mode m) {
+  if (m == mode) return;
+  leaveMode(mode);
+  enterMode(m);
+}
+
+// The RX header Menu: the three screens, then band presets (they open in SWEEP).
+static void rxMenu() {
+  static const char *const L[] = {"Meter", "Sweep", "Scan", "Full range", "70 cm ham", "430 - 440",
+                                  "433 ISM", "PMR446", "UHF business", "FRS / GMRS"};
+  static const char *const V[] = {"433.000", "", "410 - 525", "410 - 525", "420 - 450", "MHz",
+                                  "433.05 - 434.79", "446.0 - 446.2", "450 - 470", "462 - 467"};
+  static const int BAND[][2] = {{410000, 525000}, {420000, 450000}, {430000, 440000}, {433050, 434790},
+                                {446000, 446200}, {450000, 470000}, {462000, 467725}};
+  Mode was = mode;
+  leaveMode(mode);                     // SWEEP's scrolling screen has to be undone first
+  int c = uiList("RX menu", L, V, 10, takeTap);
+  if (c < 0) enterMode(was);
+  else if (c < 3) enterMode(c == 0 ? MODE_METER : c == 1 ? MODE_SWEEP : MODE_SCAN);
+  else { sweep::setBand(BAND[c - 3][0], BAND[c - 3][1]); enterMode(MODE_SWEEP); }
 }
 
 void setup() {
@@ -1374,8 +1881,8 @@ void loop() {
   detlog::pollSerial();
   detlog::flush();
   int boot = bootEvent();
-  if (boot == 1) {                       // short press: METER <-> SWEEP (in RX)
-    if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
+  if (boot == 1) {                       // short press: METER -> SWEEP -> SCAN (in RX)
+    if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : mode == MODE_SWEEP ? MODE_SCAN : MODE_METER);
     return;
   }
   if (boot == 2) {                       // held 2 s: restart into touch calibration
@@ -1393,8 +1900,8 @@ void loop() {
   pollTouch();
   if (tapIsOnTabs()) {                   // navigation: header button or RX/TX tabs
     pendingTap.valid = false;
-    if (pendingTap.y < TAB_Y) {          // header button: METER <-> SWEEP
-      if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
+    if (pendingTap.y < TAB_Y) {          // header button: the tab's menu
+      if (mode == MODE_TX) tx::menu(); else rxMenu();
     } else {
       switchMode(pendingTap.x < SCR_W / 2 ? rxMode : MODE_TX);
     }
@@ -1403,5 +1910,6 @@ void loop() {
   uiTick();                              // header stars, edge shine, row glow
   if (mode == MODE_METER) meter::loop();
   else if (mode == MODE_SWEEP) sweep::loop();
+  else if (mode == MODE_SCAN) scan::loop();
   else tx::loop();
 }

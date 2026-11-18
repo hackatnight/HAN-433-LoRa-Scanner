@@ -208,6 +208,32 @@ static void uiButton(int x, int y, int w, int h, const char *label, uint16_t fil
   lcd.setTextDatum(top_left);
 }
 
+// A full-screen list (GBC runList style, touch only, no scrolling): header with a Back
+// button, one row per item, label left and value right. Blocks until a row is tapped;
+// returns its index, or -1 for Back. tap() reports the next finished tap, if any.
+static int uiList(const char *title, const char *const *labels, const char *const *values, int n,
+                  bool (*tap)(int &x, int &y)) {
+  const int y0 = UI_HDR_H + 4, pitch = min(34, (SCR_H - y0) / max(1, n)), rowH = pitch - 2;
+  glowOff();
+  lcd.fillScreen(C_BG);
+  uiHeader(title, "Back");
+  for (int i = 0; i < n; i++) uiRow(6, y0 + i * pitch, SCR_W - 12, rowH, labels[i], values ? values[i] : nullptr, false);
+  int x, y;
+  while (tap(x, y)) {}                            // drop a tap left over from before
+  while (true) {
+    uiTick();
+    if (!tap(x, y)) { delay(10); continue; }
+    if (uiHeaderButtonHit(x, y)) { hdrOn = false; return -1; }
+    int i = (y - y0) / pitch;
+    if (y >= y0 && i < n) {                       // light the row briefly, then go
+      uiRow(6, y0 + i * pitch, SCR_W - 12, rowH, labels[i], values ? values[i] : nullptr, true);
+      delay(120);
+      hdrOn = false;
+      return i;
+    }
+  }
+}
+
 // Tab bar across the full width at y..y+h: equal tabs, the active one highlighted.
 static void uiTabs(const char *const *names, int n, int active, int y, int h) {
   lcd.fillRect(0, y, SCR_W, h, C_BG);
