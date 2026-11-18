@@ -16,7 +16,7 @@ param(
   [int]$Log = 0,
   [string[]]$Cmd = @(),
   [string]$Port = 'COM4',
-  [string]$Match = 'CMD|STATUS|SCAN|TOUCH|CAL|SWEEP|METER|TX|Radio|saved|loaded|calibration|TIME|DET|LOG|rror|Guru|panic|rst:'
+  [string]$Match = 'CMD|STATUS|SCAN|ROW|PROBE|TOUCH|CAL|SWEEP|METER|TX|Radio|saved|loaded|calibration|TIME|DET|LOG|rror|Guru|panic|rst:'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent

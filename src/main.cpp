@@ -975,8 +975,8 @@ void loadSpurs() {
 
 // Main loop, between sweeps: hands the bus to the card, appends the waiting rows and/or
 // saves the spur map, hands the bus back.
-void flush() {
-  bool rows = nBuf && (nBuf >= FLUSH_N || millis() - pendSince >= FLUSH_MS);
+void flush(bool now = false) {
+  bool rows = nBuf && (now || nBuf >= FLUSH_N || millis() - pendSince >= FLUSH_MS);
   bool spur = sdOk && spurDirty && millis() - spurSaved >= SPUR_SAVE_MS;
   if (!rows && !spur) return;
   uint32_t t = millis();
@@ -1009,6 +1009,22 @@ void flush() {
   Serial.printf("LOG %s %d rows in %lu ms (%lu logged, %lu dropped)\n", ok ? "wrote" : "FAILED",
                 nBuf, (unsigned long)(millis() - t), (unsigned long)total, (unsigned long)dropped);
   nBuf = 0;
+}
+
+// The last n rows of the log file, to serial as "ROW ..." (the "log" serial command).
+void tail(int n) {
+  if (!sdOk) { Serial.println("ROW no SD card"); return; }
+  sdBus(true);
+  File f = SD.open(FILE_NAME, FILE_READ);
+  if (f) {
+    uint32_t sz = f.size(), at = sz > (uint32_t)n * 90 ? sz - n * 90 : 0;
+    f.seek(at);
+    if (at) f.readStringUntil('\n');             // a partial line
+    Serial.printf("ROW %s, %lu bytes\n", FILE_NAME, (unsigned long)sz);
+    while (f.available()) Serial.printf("ROW %s\n", f.readStringUntil('\n').c_str());
+    f.close();
+  } else Serial.println("ROW no log file");
+  sdBus(false);
 }
 
 }  // namespace detlog
@@ -1291,17 +1307,17 @@ void loop() {
 namespace scan {
 
 const int LOCK_DB = 10;
-const uint32_t HANG_MS = 2000, MAX_LOCK_MS = 60000, SKIP_MS = 10000, LOCKOUT_MS = 300000;
+const uint32_t HANG_MS = 2000, STEADY_MS = 15000, MAX_LOCK_MS = 60000, SKIP_MS = 10000, LOCKOUT_MS = 300000;
 const int BPP = 12, NX = (GBINS + BPP - 1) / BPP, SUBS = 3;   // full range, 192 px
 const int X0 = 24, SP_Y = 150, SP_H = 44, AX_Y = SP_Y + SP_H + 2, HIT_Y = 212;
 
 bool locked;
 int lockG, lockFloor, peak, level;
 uint32_t tStart, tLast, tShown;
-uint16_t hits;
+uint16_t hits, wins;                             // windows heard / listened while locked
 int16_t mv[NX * SUBS];
 uint16_t mg[NX * SUBS];
-struct Skip { int16_t g; uint32_t until; } skips[8];
+struct Skip { int16_t g; uint32_t until; } skips[24];   // a lockout takes 9 (+-1 MHz)
 uint32_t shownTotal;
 
 bool skipped(int g) {
@@ -1310,7 +1326,7 @@ bool skipped(int g) {
 }
 void skip(int g, uint32_t ms) {
   int o = 0;                                     // the slot that frees up first
-  for (int i = 1; i < 8; i++) if ((int32_t)(skips[i].until - skips[o].until) < 0) o = i;
+  for (int i = 1; i < 24; i++) if ((int32_t)(skips[i].until - skips[o].until) < 0) o = i;
   skips[o] = {(int16_t)g, millis() + ms};
 }
 
@@ -1332,8 +1348,18 @@ void status(const char *s, uint16_t c) {
 
 void bigFreq(int khz, uint16_t c) {
   char b[12];
-  if (khz) snprintf(b, sizeof b, "%d.%03d", khz / 1000, khz % 1000);
-  else snprintf(b, sizeof b, "---.---");
+  static bool text;                              // "SCANNING" is up: clear it before digits
+  if (!khz || text) lcd.fillRect(0, 56, SCR_W, 50, C_BG);
+  text = !khz;
+  if (!khz) {                                    // Font7 is digits only: no dashes
+    lcd.setFont(&fonts::Font4);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextColor(c, C_BG);
+    lcd.drawString("SCANNING", SCR_W / 2, 80);
+    lcd.setTextDatum(top_left);
+    return;
+  }
+  snprintf(b, sizeof b, "%d.%03d", khz / 1000, khz % 1000);
   lcd.setFont(&fonts::Font7);
   lcd.setTextDatum(top_center);
   lcd.setTextColor(c, C_BG);
@@ -1402,7 +1428,7 @@ void startScan() {
   locked = false;
   rf::setBw(rf::BW_250);
   status("Scanning 410 - 525 MHz", C_DIM);
-  bigFreq(0, C_DIM);
+  bigFreq(lockG ? gKHz(lockG) : 0, C_DIM);      // the last lock stays, dimmed
   bar(-200);
 }
 
@@ -1418,14 +1444,27 @@ bool check(int g0) {
   }
   int fl, tp;
   rf::levels(ref, 16, fl, tp);
-  int best = -200, bestG = g0;
-  for (int g = max(0, g0 - 6); g <= min(GBINS - 1, g0 + 6); g++) {
-    if (detlog::isSpur(g)) continue;
+  int16_t near[13];
+  int best = -200, bi = 6;
+  for (int i = 0; i < 13; i++) {
+    int g = g0 - 6 + i;
+    near[i] = -200;
+    if (g < 0 || g >= GBINS || detlog::isSpur(g)) continue;
     rf::tune(gKHz(g));
-    delayMicroseconds(g == max(0, g0 - 6) ? 1000 : 250);
-    int v = rf::rssi();
-    if (v > best) { best = v; bestG = g; }
+    delayMicroseconds(i && near[i - 1] > -200 ? 250 : 1000);
+    for (int k = 0; k < 4; k++) {                // best of 4: one read is a coin toss
+      near[i] = max((int)near[i], rf::rssi());
+      if (k < 3) delayMicroseconds(150);
+    }
+    if (near[i] > best) { best = near[i]; bi = i; }
   }
+  // A strong signal reads flat across several bins (the receiver tops out near -11 dBm):
+  // take the middle of the run within 6 dB of the loudest, whose edges are steep and
+  // even on both sides - not whichever bin read a hair louder.
+  int lo = bi, hi = bi;
+  while (lo > 0 && near[lo - 1] >= best - 6) lo--;
+  while (hi < 12 && near[hi + 1] >= best - 6) hi++;
+  int bestG = g0 - 6 + (lo + hi) / 2;
   // One loud reading can be a noise blip: read the best bin 8 more times, and lock only
   // if most of them are over the line too.
   int over = 0;
@@ -1443,7 +1482,9 @@ void endLock(bool longOut) {
   detlog::Det d = {tStart, tLast, (int16_t)lockG, (int16_t)lockG, (int16_t)peak,
                    (int16_t)(peak - lockFloor), hits, 0, true, detlog::SRC_SCAN};
   detlog::emit(d);
-  skip(lockG, longOut ? LOCKOUT_MS : SKIP_MS);
+  if (longOut)                                   // a lockout covers +-1 MHz: wide signals
+    for (int g = lockG - 20; g <= lockG + 20; g += 5) skip(constrain(g, 0, GBINS - 1), LOCKOUT_MS);
+  else skip(lockG, SKIP_MS);
   if (detlog::total != shownTotal) title();
   drawHits();
   startScan();
@@ -1483,6 +1524,7 @@ void sweepOnce() {
       if (mv[n - 1] > best) best = mv[n - 1];
     }
     if (x % 32 == 0) {
+      bigFreq(gKHz(x * BPP), C_DIM);             // live: where the sweep is now
       pollTouch();
       if (pendingTap.valid || digitalRead(PIN_BOOT) == LOW) return;
     }
@@ -1497,7 +1539,7 @@ void sweepOnce() {
   if (c >= 0 && check(mg[c])) {
     locked = true;
     tStart = tLast = tShown = millis();
-    hits = 1;
+    hits = wins = 1;
     int khz = gKHz(lockG);
     Serial.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
     bigFreq(khz, C_TEXT);
@@ -1520,6 +1562,7 @@ void listen() {
   }
   int avg = sum / n;
   uint32_t now = millis();
+  wins++;
   if (over * 2 >= n) { tLast = now; hits++; if (avg > peak) peak = avg; }
   bar(avg);
   char s[40];
@@ -1527,8 +1570,20 @@ void listen() {
            (unsigned long)((now - tStart) % 1000 / 100), (unsigned long)((now - tLast) / 1000),
            (unsigned long)((now - tLast) % 1000 / 100));
   status(s, now - tLast < 200 ? C_ALERT : C_TEXT);
+  uint32_t on = now - tStart;
   if (now - tLast > HANG_MS) endLock(false);
-  else if (now - tStart > MAX_LOCK_MS) endLock(true);
+  else if (on > STEADY_MS && hits >= wins * 95 / 100) {
+    // Heard in nearly every window for STEADY_MS: a steady carrier, not traffic. Mark the
+    // bin a spur (as if it had been busy for a long time); it fades if the carrier goes.
+    int khz = gKHz(lockG);
+    Serial.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
+    for (int g = max(0, lockG - 1); g <= min(GBINS - 1, lockG + 1); g++) {
+      detlog::busy[g] = 65535;
+      detlog::spurMap[g >> 3] |= 1 << (g & 7);
+    }
+    detlog::spurDirty = true;
+    endLock(true);
+  } else if (on > MAX_LOCK_MS) endLock(true);
 }
 
 void loop() {
@@ -1889,10 +1944,16 @@ static void rxMenu() {
 //   T<unix ms>      set the clock           status         print the state
 //   tap X Y         a tap at screen X,Y     drag DX Y      a drag of DX px at row Y
 //   stop            stop a transmission     boot           a short BOOT press
+//   log             last rows of the SD log, as "ROW ..."
+//   probe KHZ       fine RSSI profile around KHZ (410000-525000), as "PROBE ..."
 //   mode meter|sweep|scan|tx                send N         TX sound board pad N (0-7)
 // Taps and drags go straight in; screen changes wait for the main loop.
-static int queuedMode = -1, queuedSend = -1;
-static bool queuedBoot;
+static int queuedMode = -1, queuedSend = -1, queuedProbe;
+
+// "probe F": RSSI every 12.5 kHz over F +-150 kHz (62.5 kHz receiver, best of 8 reads
+// each), as one "PROBE" line, 40 times (~3 s). Then the screen it was on starts again.
+static void probe(int khz);
+static bool queuedBoot, queuedLog;
 
 static void printStatus() {
   static const char *const M[] = {"meter", "sweep", "scan", "tx"};
@@ -1920,6 +1981,8 @@ static void serialCommands() {
     else if (sscanf(line, "drag %d %d", &a, &b) == 2) pendingDrag = {true, a, b};
     else if (!strcmp(line, "stop")) pendingTap = {true, 0, 0};
     else if (!strcmp(line, "boot")) queuedBoot = true;
+    else if (!strcmp(line, "log")) queuedLog = true;
+    else if (sscanf(line, "probe %d", &a) == 1 && a >= 410000 && a <= 525000) queuedProbe = a;
     else if (sscanf(line, "send %d", &a) == 1 && a >= 0 && a < tx::NUM_SND) queuedSend = a;
     else if (sscanf(line, "mode %11s", w) == 1) {
       static const char *const M[] = {"meter", "sweep", "scan", "tx"};
@@ -1929,6 +1992,46 @@ static void serialCommands() {
     else { Serial.printf("CMD ? %s\n", line); continue; }
     Serial.printf("CMD ok %s\n", line);
   }
+}
+
+static void probe(int khz) {
+  leaveMode(mode);
+  glowOff();
+  lcd.fillScreen(C_BG);
+  char t[24];
+  snprintf(t, sizeof t, "PROBE %d.%03d", khz / 1000, khz % 1000);
+  uiHeader(t);
+  lcd.setFont(&fonts::Font4);
+  lcd.setTextDatum(middle_center);
+  lcd.setTextPadding(SCR_W);
+  for (int s = 3; s > 0; s--) {
+    snprintf(t, sizeof t, "Key up in %d", s);
+    lcd.setTextColor(C_TEXT, C_BG);
+    lcd.drawString(t, SCR_W / 2, 150);
+    delay(1000);
+  }
+  lcd.setTextColor(C_ALERT, C_BG);
+  lcd.drawString("KEY UP NOW", SCR_W / 2, 150);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+  rf::startRx(rf::BW_62);
+  for (int rep = 0; rep < 40; rep++) {           // ~3 s
+    char b[200];
+    int n = snprintf(b, sizeof b, "PROBE %d.%03d -150..+150 kHz /12.5:", khz / 1000, khz % 1000);
+    for (int d = -150000; d <= 150000; d += 12500) {
+      uint32_t frf = (uint64_t)(khz * 1000LL + d) * 524288 / 32000000;   // Hz x 2^19 / 32 MHz
+      radioSPI.beginTransaction(rf::fastSPI);
+      rf::rw(0x06, frf >> 16); rf::rw(0x07, frf >> 8); rf::rw(0x08, frf);
+      rf::rw(0x0D, rf::RX_CFG | 0x20);
+      radioSPI.endTransaction();
+      delayMicroseconds(1000);
+      int best = -200;
+      for (int k = 0; k < 8; k++) { best = max(best, rf::rssi()); delayMicroseconds(250); }
+      n += snprintf(b + n, sizeof b - n, " %d", best);
+    }
+    Serial.println(b);
+  }
+  enterMode(mode);
 }
 
 void setup() {
@@ -1992,6 +2095,8 @@ void setup() {
 void loop() {
   if (Serial.available()) serialCommands();
   detlog::flush();
+  if (queuedLog) { queuedLog = false; detlog::flush(true); detlog::tail(10); }
+  if (queuedProbe) { int f = queuedProbe; queuedProbe = 0; probe(f); return; }
   if (queuedMode >= 0) { Mode m = (Mode)queuedMode; queuedMode = -1; switchMode(m); return; }
   if (queuedSend >= 0) { int s = queuedSend; queuedSend = -1; switchMode(MODE_TX); tx::send(s); return; }
   int boot = bootEvent();
