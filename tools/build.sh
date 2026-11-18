@@ -5,6 +5,7 @@
 #
 #   tools/build.sh              build docs/firmware/HAN-433-Scanner.bin
 #   tools/build.sh flash COM4   build, then write that same image to a board
+#   LANDSCAPE=1 tools/build.sh  the landscape build (-DHAN_LANDSCAPE), docs/firmware/HAN-433-Scanner-Landscape.bin
 #
 # Used by CI (.github/workflows/build.yml) and locally. Override if needed:
 #   ACLI=/path/to/arduino-cli         (default: arduino-cli on PATH)
@@ -19,7 +20,13 @@ CFG=()
 [ -n "$ACLI_CONFIG" ] && CFG=(--config-file "$ACLI_CONFIG")
 WORK=${WORK:-$ROOT/build}
 FQBN=esp32:esp32:esp32:FlashMode=dio,FlashFreq=40,CPUFreq=240,PartitionScheme=default,DebugLevel=none
-OUT="$ROOT/docs/firmware/HAN-433-Scanner.bin"
+NAME=HAN-433-Scanner; EXTRA=()
+if [ -n "$LANDSCAPE" ]; then
+  NAME=HAN-433-Scanner-Landscape
+  EXTRA=(--build-property "compiler.cpp.extra_flags=-DHAN_LANDSCAPE")
+  WORK=$WORK/landscape
+fi
+OUT="$ROOT/docs/firmware/$NAME.bin"
 
 command -v "$ACLI" >/dev/null 2>&1 || [ -x "$ACLI" ] || { echo "arduino-cli not found at: $ACLI (set ACLI=...)" >&2; exit 1; }
 
@@ -39,12 +46,12 @@ fi
 
 rm -rf "$WORK/out"
 echo "== compile"
-"$ACLI" "${CFG[@]}" compile --fqbn "$FQBN" --build-path "$WORK/cache" --output-dir "$WORK/out" "$ROOT" 2>&1 \
+"$ACLI" "${CFG[@]}" compile --fqbn "$FQBN" "${EXTRA[@]}" --build-path "$WORK/cache" --output-dir "$WORK/out" "$ROOT" 2>&1 \
   | grep -E "Sketch uses|Global variables|error|Error" || true
 APP="$WORK/out/$(basename "$ROOT").ino.bin"
 [ -f "$APP" ] || { echo "FAILED: no app image produced" >&2; exit 1; }
 
-echo "== merge -> docs/firmware/HAN-433-Scanner.bin"
+echo "== merge -> docs/firmware/$NAME.bin"
 $ESPTOOL --chip esp32 merge_bin -o "$OUT" \
   --flash_mode dio --flash_freq 40m --flash_size 4MB \
   0x1000 "$WORK/out/$(basename "$ROOT").ino.bootloader.bin" \

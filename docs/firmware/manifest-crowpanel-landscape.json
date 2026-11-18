@@ -1,0 +1,16 @@
+{
+  "name": "H@N 433MHz LoRa Module Scanner (landscape)",
+  "version": "0.3.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "HAN-433-Scanner-Landscape.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

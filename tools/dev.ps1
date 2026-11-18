@@ -13,6 +13,7 @@
 # (%USERPROFILE%\.arduino-han433), so the IDE's own ESP32 core is left alone.
 param(
   [switch]$Flash,
+  [switch]$Landscape,                     # the landscape build (LANDSCAPE=1 tools/build.sh)
   [int]$Log = 0,
   [string[]]$Cmd = @(),
   [string]$Port = 'COM4',
@@ -23,7 +24,8 @@ $repo = Split-Path $PSScriptRoot -Parent
 
 if ($Flash -or $Log -eq 0) {
   $env:ACLI = 'C:/Program Files/Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe'
-  $env:ACLI_CONFIG = "$env:USERPROFILE/.arduino-han433/arduino-cli.yaml"
+  if ($Landscape) { $env:LANDSCAPE = '1' } else { Remove-Item Env:LANDSCAPE -ErrorAction SilentlyContinue }
+  $env:ACLI_CONFIG ="$env:USERPROFILE/.arduino-han433/arduino-cli.yaml"
   # Git Bash, not WSL's bash.exe
   $bash = Join-Path (Split-Path (Split-Path (Get-Command git).Source)) 'bin\bash.exe'
   $a = @("$repo/tools/build.sh")

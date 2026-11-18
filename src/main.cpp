@@ -138,7 +138,15 @@ public:
 
 static LGFX lcd;
 
+// Two builds from this one file: portrait (default) and landscape (-DHAN_LANDSCAPE, see
+// tools/build.sh), which has one combined spectrum + waterfall + scanner screen.
+// Touch calibration is always done and saved in portrait, so both builds share it.
+#ifdef HAN_LANDSCAPE
+static const int SCR_W = 320, SCR_H = 240, LAND_ROT = 3;   // 3: cables at the bottom
+#else
 static const int SCR_W = 240, SCR_H = 320;
+#endif
+static const int P_W = 240, P_H = 320;   // the panel in portrait (rotation 2)
 #include "han_ui.h"
 #include "voice_hello.h"
 static uint16_t C_GRID, C_ALERT;   // on top of the theme colors (han_ui.h)
@@ -164,7 +172,11 @@ static uint16_t snrColor(float snr) {
 // ---------------------------------------------------------------- tab bar
 // RX | TX along the bottom edge. Full width and 34 px tall, so they still work if the
 // touch mapping is off by a few pixels.
+#ifdef HAN_LANDSCAPE
+static const int TAB_Y = SCR_H, TAB_H = 0;   // no tabs: the header button goes to TX
+#else
 static const int TAB_Y = 286, TAB_H = 34;
+#endif
 
 static void drawTabs(int active) {   // 0 = RX, 1 = TX
   static const char *const names[2] = {"RX", "TX"};
@@ -197,10 +209,14 @@ static Preferences prefs;
 static bool rawToScreen(int rx, int ry, int &sx, int &sy) {
   if (!cal.valid) return false;
   float ux = cal.swap ? ry : rx, uy = cal.swap ? rx : ry;
-  sx = (int)lroundf(cal.ax * ux + cal.bx);
-  sy = (int)lroundf(cal.ay * uy + cal.by);
-  sx = sx < 0 ? 0 : (sx > SCR_W - 1 ? SCR_W - 1 : sx);
-  sy = sy < 0 ? 0 : (sy > 319 ? 319 : sy);
+  int px = constrain((int)lroundf(cal.ax * ux + cal.bx), 0, P_W - 1);   // portrait pixels
+  int py = constrain((int)lroundf(cal.ay * uy + cal.by), 0, P_H - 1);
+#ifdef HAN_LANDSCAPE
+  if (LAND_ROT == 1) { sx = P_H - 1 - py; sy = px; }      // rotation 2 -> LAND_ROT
+  else { sx = py; sy = P_W - 1 - px; }
+#else
+  sx = px; sy = py;
+#endif
   return true;
 }
 
@@ -340,8 +356,8 @@ static void touchDiag() {
   lcd.setFont(&fonts::Font2);
   lcd.setTextDatum(middle_center);
   lcd.setTextColor(C_DIM, C_BG);
-  lcd.setTextPadding(SCR_W - 70);
-  lcd.drawString(buf, SCR_W / 2, 230);
+  lcd.setTextPadding(P_W - 70);
+  lcd.drawString(buf, P_W / 2, 230);
   lcd.setTextPadding(0);
   static uint32_t lastPrint = 0;
   if (pen || got || millis() - lastPrint > 2000) { lastPrint = millis(); Serial.printf("CAL %s\n", buf); }
@@ -418,7 +434,7 @@ static bool calSolve(const float rx[4], const float ry[4], const float PX[4], co
 static bool calibrateTouch() {
   const int SCR_H = 320;
   // targets in screen coords: TL, TR, BL, BR
-  const int TX[4] = { 30, SCR_W - 30, 30, SCR_W - 30 };
+  const int TX[4] = { 30, P_W - 30, 30, P_W - 30 };
   const int TY[4] = { 50, 50, SCR_H - 30, SCR_H - 30 };
   float rx[4], ry[4];
   Serial.println("Touch calibration started");
@@ -426,10 +442,10 @@ static bool calibrateTouch() {
   lcd.setFont(&fonts::Font2);
   lcd.setTextColor(C_TEXT, C_BG);
   lcd.setTextDatum(middle_center);
-  lcd.drawString("Touch calibration", SCR_W / 2, SCR_H / 2 - 20);
+  lcd.drawString("Touch calibration", P_W / 2, SCR_H / 2 - 20);
   lcd.setTextColor(C_DIM, C_BG);
-  lcd.drawString("Tap the center of each cross", SCR_W / 2, SCR_H / 2 + 5);
-  lcd.drawString("(BOOT button = skip)", SCR_W / 2, SCR_H / 2 + 25);
+  lcd.drawString("Tap the center of each cross", P_W / 2, SCR_H / 2 + 5);
+  lcd.drawString("(BOOT button = skip)", P_W / 2, SCR_H / 2 + 25);
   for (int i = 0; i < 4; i++) {
     drawCross(TX[i], TY[i], C_ACCENT);
     if (!sampleRaw(rx[i], ry[i])) { Serial.println("Touch calibration skipped"); return false; }
@@ -444,7 +460,7 @@ static bool calibrateTouch() {
 
 // Runs calibration (retrying on readings that don't line up) and saves it.
 // Called from setup(), before the radio starts (see the SD note above).
-static void runCalibration() {
+static void calibrateLoop() {
   for (int attempt = 0; attempt < 3; attempt++) {
     if (calibrateTouch()) {
       const char *where = saveCal();
@@ -452,9 +468,9 @@ static void runCalibration() {
       lcd.setFont(&fonts::Font2);
       lcd.setTextDatum(middle_center);
       lcd.setTextColor(lcd.color565(60, 220, 90), C_BG);
-      lcd.drawString("Calibration saved", SCR_W / 2, 140);
+      lcd.drawString("Calibration saved", P_W / 2, 140);
       lcd.setTextColor(C_DIM, C_BG);
-      lcd.drawString(String("to ") + where, SCR_W / 2, 165);
+      lcd.drawString(String("to ") + where, P_W / 2, 165);
       delay(1500);
       return;
     }
@@ -463,10 +479,18 @@ static void runCalibration() {
     lcd.setFont(&fonts::Font2);
     lcd.setTextDatum(middle_center);
     lcd.setTextColor(C_ALERT, C_BG);
-    lcd.drawString("Didn't line up - try again", SCR_W / 2, 150);
+    lcd.drawString("Didn't line up - try again", P_W / 2, 150);
     delay(1500);
   }
+}
+// Calibration is always in portrait, the panel's own orientation, in both builds.
+static void runCalibration() {
+  lcd.setRotation(2);
+  calibrateLoop();
   while (digitalRead(PIN_BOOT) == LOW) delay(10);   // let go of BOOT before carrying on
+#ifdef HAN_LANDSCAPE
+  lcd.setRotation(LAND_ROT);
+#endif
 }
 
 // ---------------------------------------------------------------- touch input
@@ -1597,6 +1621,390 @@ void loop() {
 
 }  // namespace scan
 
+#ifdef HAN_LANDSCAPE
+// ================================================================ LANDSCAPE: one screen
+// Spectrum + waterfall of a window onto the grid, with the scanner working over that same
+// window ("scan what you see"). Bottom bar: < - span + > move and zoom the window, Scan
+// on/off, Band presets, Fast/Slow. Right panel: the scanner - frequency, state, level,
+// last hits; tap it to skip a lock. Header button: TX. BOOT: Scan on/off.
+// The waterfall is a ring of rows in RAM, pushed to the screen once a sweep: in landscape
+// the controller's vertical scroll would run sideways, so it can't do the job here.
+namespace land {
+
+const int NPX = 192, X0 = 22;                          // 192 px x 12 bins = the whole grid
+const int ZOOMS[] = {1, 2, 3, 5, 12}, NZOOM = 5;
+const int SPEC_Y = UI_HDR_H + 4, SPEC_H = 64, AXIS_Y = SPEC_Y + SPEC_H + 2;
+const int WF_Y = AXIS_Y + 12, WF_H = 196 - WF_Y;
+const int BAR_Y = 202, BAR_H = 34;
+const int PX0 = X0 + NPX + 6, PW = SCR_W - PX0 - 2;    // right panel
+// bottom bar: < - + > Scan Band Speed (the span is written between - and +)
+const int BX[7] = {2, 34, 114, 146, 182, 234, 278}, BWD[7] = {30, 30, 30, 30, 48, 40, 40};
+
+int vStart = (430000 - G0_KHZ) / G_STEP, bpp = 1;
+bool scanOn = true, slow = false;
+int16_t px[NPX], hold[NPX], mv[600];
+uint16_t mg[600], wf[NPX * WF_H];
+int wfTop, floorDbm = -120;
+// the lock (the up-close check itself is scan::check)
+bool locked;
+int lockG = -1, lockFloor, peak;
+uint32_t tStart, tLast;
+uint16_t hits, wins;
+uint32_t shownTotal;
+
+inline int specH(int dbm) { int v = (dbm + 130) * SPEC_H / 120; return v < 0 ? 0 : v > SPEC_H ? SPEC_H : v; }
+int npx() { return min(NPX, (GBINS - vStart + bpp - 1) / bpp); }
+int subs() { return (bpp + 4) / 5; }
+int pointBin(int x, int s) { return min(GBINS - 1, vStart + x * bpp + s * bpp / subs() + bpp / subs() / 2); }
+uint8_t bw() { return bpp == 1 ? rf::BW_62 : bpp == 2 ? rf::BW_125 : rf::BW_250; }
+int zoomIdx() { int z = 0; while (z < NZOOM - 1 && ZOOMS[z] != bpp) z++; return z; }
+
+void title() {
+  shownTotal = detlog::total;
+  char s[32];
+  snprintf(s, sizeof s, sdOk ? "H@N 433   %lu logged" : "H@N 433   %lu, no SD", (unsigned long)shownTotal);
+  uiHeader(s, "TX");
+}
+
+// ---- right panel
+void panelFreq(int khz, uint16_t c) {            // 0 = "Scan off"
+  char b[12];
+  lcd.setFont(&fonts::Font4);
+  lcd.setTextDatum(top_center);
+  lcd.setTextColor(c, C_BG);
+  lcd.setTextPadding(PW);
+  if (khz) snprintf(b, sizeof b, "%d.%03d", khz / 1000, khz % 1000);
+  else snprintf(b, sizeof b, "Scan off");
+  lcd.drawString(b, PX0 + PW / 2, SPEC_Y + 2);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+void panelStatus(const char *s, uint16_t c) {
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(top_center);
+  lcd.setTextColor(c, C_BG);
+  lcd.setTextPadding(PW);
+  lcd.drawString(s, PX0 + PW / 2, SPEC_Y + 30);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+void panelLevel(int dbm) {
+  const int y = SPEC_Y + 50;
+  lcd.fillRect(PX0, y, PW, 8, C_GRID);
+  if (dbm > -140) lcd.fillRect(PX0, y, constrain((dbm + 130) * PW / 120, 0, PW), 8, snrColor(dbm - lockFloor));
+  char b[12];
+  snprintf(b, sizeof b, dbm > -140 ? "%d dBm" : "", dbm);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextDatum(top_center);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextPadding(PW);
+  lcd.drawString(b, PX0 + PW / 2, y + 11);
+  lcd.setTextPadding(0);
+  lcd.setTextDatum(top_left);
+}
+void panelHits() {
+  const int y0 = SPEC_Y + 76;
+  lcd.fillRect(PX0, y0, PW, BAR_Y - 4 - y0, C_BG);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextDatum(top_left);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.drawString("Last hits", PX0, y0);
+  for (int i = 0; i < detlog::nRecent && i < 5; i++) {
+    const detlog::Det &d = detlog::recent[i];
+    int khz = gKHz(d.bin);
+    uint32_t ms = d.t1 - d.t0;
+    char b[24];
+    snprintf(b, sizeof b, "%d.%03d %lu.%lus", khz / 1000, khz % 1000, (unsigned long)(ms / 1000),
+             (unsigned long)(ms % 1000 / 100));
+    lcd.setTextColor(i ? C_DIM : C_TEXT, C_BG);
+    lcd.drawString(b, PX0, y0 + 14 + i * 14);
+  }
+}
+void panelIdle() {                               // not locked: the last lock, dimmed
+  panelFreq(!scanOn ? 0 : gKHz(lockG >= 0 ? lockG : vStart), C_DIM);
+  panelStatus(scanOn ? "Scanning" : "Sweep only", C_DIM);
+  panelLevel(-200);
+}
+
+// ---- spectrum, axis, bottom bar
+void drawCol(int i) {
+  int x = X0 + i, h = specH(px[i]), y0 = SPEC_Y + SPEC_H;
+  lcd.drawFastVLine(x, SPEC_Y, SPEC_H - h, C_BG);
+  lcd.drawFastVLine(x, y0 - h, h, snrColor(px[i] - floorDbm));
+  lcd.drawPixel(x, y0 - 1 - specH(hold[i]), C_TEXT);
+  if (i % 6 < 3) lcd.drawPixel(x, y0 - 1 - specH(floorDbm), C_ACCENT);
+}
+void drawAxis() {
+  lcd.fillRect(0, AXIS_Y, PX0 - 3, WF_Y - AXIS_Y, C_BG);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.setTextDatum(top_center);
+  char b[8];
+  const int n = npx();
+  for (int x = 0; x < n; x += 48) {
+    int xx = x ? x : 12, khz = gKHz(vStart + xx * bpp);
+    lcd.drawFastVLine(X0 + xx, AXIS_Y, 2, C_DIM);
+    if (bpp == 1) snprintf(b, sizeof b, "%d.%d", khz / 1000, khz % 1000 / 100);
+    else snprintf(b, sizeof b, "%d", khz / 1000);
+    lcd.drawString(b, X0 + xx, AXIS_Y + 3);
+  }
+  lcd.setTextDatum(top_left);
+}
+bool btnOn(int i) {
+  int z = zoomIdx();
+  switch (i) {
+    case 0: return vStart > 0;
+    case 1: return z < NZOOM - 1;
+    case 2: return z > 0;
+    case 3: return vStart + NPX * bpp < GBINS;
+    default: return true;
+  }
+}
+void drawBar() {
+  static const char *const L[7] = {"<", "-", "+", ">", "Scan", "Band", "Fast"};
+  lcd.fillRect(0, BAR_Y - 2, SCR_W, SCR_H - BAR_Y + 2, C_BG);
+  for (int i = 0; i < 7; i++) {
+    bool on = btnOn(i);
+    const char *l = i == 6 && slow ? "Slow" : L[i];
+    uint16_t fill = i == 4 && scanOn ? C_HILITE : C_PANEL;
+    uiButton(BX[i], BAR_Y, BWD[i], BAR_H, l, fill, on ? C_ACCENT : C_PANEL, on ? C_TEXT : C_DIM);
+  }
+  char b[12];
+  int khz = min(NPX * bpp, GBINS) * G_STEP;
+  snprintf(b, sizeof b, "%d.%d MHz", khz / 1000, khz % 1000 / 100);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(C_TEXT, C_BG);
+  lcd.setTextDatum(middle_center);
+  lcd.drawString(b, (BX[1] + BWD[1] + BX[2]) / 2, BAR_Y + BAR_H / 2);
+  lcd.setTextDatum(top_left);
+}
+
+void pushWaterfall() {
+  lcd.pushImage(X0, WF_Y, NPX, WF_H - wfTop, wf + wfTop * NPX);
+  if (wfTop) lcd.pushImage(X0, WF_Y + WF_H - wfTop, NPX, wfTop, wf);
+}
+
+// ---- the lock
+void endLock(bool longOut) {
+  detlog::Det d = {tStart, tLast, (int16_t)lockG, (int16_t)lockG, (int16_t)peak,
+                   (int16_t)(peak - lockFloor), hits, 0, true, detlog::SRC_SCAN};
+  detlog::emit(d);
+  if (longOut)                                   // +-1 MHz: wide signals
+    for (int g = lockG - 20; g <= lockG + 20; g += 5) scan::skip(constrain(g, 0, GBINS - 1), scan::LOCKOUT_MS);
+  else scan::skip(lockG, scan::SKIP_MS);
+  locked = false;
+  rf::setBw(bw());
+  if (detlog::total != shownTotal) title();
+  panelHits();
+  panelIdle();
+}
+
+void listen() {
+  uint32_t t0 = millis();
+  int n = 0, over = 0, sum = 0;
+  while (millis() - t0 < 50) {
+    int v = rf::rssi();
+    sum += v; n++;
+    if (v >= lockFloor + scan::LOCK_DB) over++;
+    delayMicroseconds(900);
+  }
+  int avg = sum / n;
+  uint32_t now = millis(), on = now - tStart;
+  wins++;
+  if (over * 2 >= n) { tLast = now; hits++; if (avg > peak) peak = avg; }
+  panelLevel(avg);
+  char s[24];
+  snprintf(s, sizeof s, "LOCKED %lu.%lus", (unsigned long)(on / 1000), (unsigned long)(on % 1000 / 100));
+  panelStatus(s, now - tLast < 200 ? C_ALERT : C_TEXT);
+  if (now - tLast > scan::HANG_MS) endLock(false);
+  else if (on > scan::STEADY_MS && hits >= wins * 95 / 100) {
+    int khz = gKHz(lockG);
+    Serial.printf("SCAN %d.%03d MHz steady carrier: marked as a spur\n", khz / 1000, khz % 1000);
+    for (int g = max(0, lockG - 1); g <= min(GBINS - 1, lockG + 1); g++) {
+      detlog::busy[g] = 65535;
+      detlog::spurMap[g >> 3] |= 1 << (g & 7);
+    }
+    detlog::spurDirty = true;
+    endLock(true);
+  } else if (on > scan::MAX_LOCK_MS) endLock(true);
+}
+
+// ---- the window
+void setView(int start, int zoom) {
+  if (locked) endLock(false);
+  bpp = zoom;
+  vStart = constrain(start, 0, max(0, GBINS - NPX * bpp));
+  detlog::closeAll();
+  for (int i = 0; i < NPX; i++) hold[i] = px[i] = -130;
+  memset(wf, 0, sizeof wf);
+  rf::setBw(bw());
+  lcd.fillRect(X0, SPEC_Y, NPX, SPEC_H, C_BG);
+  pushWaterfall();
+  drawAxis();
+  drawBar();
+  int a = gKHz(vStart), b = gKHz(min(GBINS, vStart + npx() * bpp));
+  Serial.printf("SWEEP view %d.%02d-%d.%02d MHz, %d kHz/px\n", a / 1000, a % 1000 / 10,
+                b / 1000, b % 1000 / 10, bpp * G_STEP);
+}
+void setScan(bool on) {
+  if (locked) endLock(false);
+  scanOn = on;
+  Serial.printf("SCAN %s\n", on ? "on" : "off");
+  drawBar();
+  panelIdle();
+}
+void drawAll() {
+  glowOff();
+  lcd.fillScreen(C_BG);
+  title();
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(C_DIM, C_BG);
+  lcd.setTextDatum(middle_right);
+  for (int d = -110; d <= -30; d += 40) lcd.drawNumber(d, X0 - 2, SPEC_Y + SPEC_H - 1 - specH(d));
+  lcd.setTextDatum(top_left);
+  lcd.drawFastVLine(PX0 - 3, SPEC_Y, BAR_Y - 4 - SPEC_Y, C_GRID);
+  panelHits();
+  panelIdle();
+  setView(vStart, bpp);
+}
+// Band presets: the closest zoom that holds the band, centered (setView clamps).
+void bandMenu() {
+  static const char *const L[] = {"Full range", "70 cm ham", "430 - 440", "433 ISM", "PMR446",
+                                  "UHF business", "FRS / GMRS"};
+  static const char *const V[] = {"410 - 525", "420 - 450", "MHz", "433.05 - 434.79", "446.0 - 446.2",
+                                  "450 - 470", "462 - 467"};
+  static const int BAND[][2] = {{410000, 525000}, {420000, 450000}, {430000, 440000}, {433050, 434790},
+                                {446000, 446200}, {450000, 470000}, {462000, 467725}};
+  if (locked) endLock(false);
+  int c = uiList("Band", L, V, 7, takeTap);
+  if (c >= 0) {
+    int z = ZOOMS[NZOOM - 1];
+    for (int i = 0; i < NZOOM; i++)
+      if (NPX * ZOOMS[i] * G_STEP >= BAND[c][1] - BAND[c][0]) { z = ZOOMS[i]; break; }
+    bpp = z;
+    vStart = ((BAND[c][0] + BAND[c][1]) / 2 - G0_KHZ) / G_STEP - NPX * z / 2;
+  }
+  drawAll();
+}
+void button(int i) {
+  if (!btnOn(i)) return;
+  int z = zoomIdx(), span = NPX * bpp, center = vStart + min(span, GBINS) / 2;
+  switch (i) {
+    case 0: setView(vStart - span, bpp); break;
+    case 3: setView(vStart + span, bpp); break;
+    case 1: case 2: { int nb = ZOOMS[i == 1 ? z + 1 : z - 1]; setView(center - NPX * nb / 2, nb); break; }
+    case 4: setScan(!scanOn); break;
+    case 5: bandMenu(); break;
+    default: slow = !slow; drawBar(); break;
+  }
+}
+
+void enter() {
+  rf::startRx(bw());
+  drawAll();
+}
+void leave() {
+  if (locked) endLock(false);
+  radio.begin(METER_FREQ_MHZ);                   // LoRa, as the other screens leave it
+}
+
+// One sweep of the window, drawing as it goes; returns early on input.
+void sweepRow() {
+  uint32_t t0 = millis();
+  const int nx = npx(), ns = subs();
+  const uint32_t dwell = bpp == 1 ? SWEEP_DWELL_US : bpp == 2 ? 150 : 120;
+  rf::tune(gKHz(pointBin(0, 0)));
+  delayMicroseconds(1000);
+  int n = 0;
+  for (int x = 0; x < nx; x++) {
+    int best = -200;
+    for (int s = 0; s < ns; s++) {
+      uint32_t t = micros();
+      int g = pointBin(x, s);
+      rf::tune(gKHz(g));
+      if (x && !s) drawCol(x - 1);
+      while (micros() - t < dwell) {}
+      int v = rf::rssi();
+      if (slow) {                                // Slow: average 4 reads, a steadier floor
+        for (int k = 0; k < 3; k++) { delayMicroseconds(100); v += rf::rssi(); }
+        v /= 4;
+      }
+      mv[n] = v; mg[n++] = g;
+      if (v > best) best = v;
+    }
+    px[x] = best;
+    if (best > hold[x]) hold[x] = best;
+    if (x % 32 == 0) {
+      if (scanOn) panelFreq(gKHz(pointBin(x, 0)), C_DIM);   // live: where the sweep is
+      pollTouch();
+      if (pendingTap.valid || pendingDrag.valid || digitalRead(PIN_BOOT) == LOW) return;
+    }
+  }
+  drawCol(nx - 1);
+  int top;
+  rf::levels(mv, n, floorDbm, top);
+
+  wfTop = (wfTop + WF_H - 1) % WF_H;             // waterfall: the newest row on top
+  uint16_t *row = wf + wfTop * NPX;
+  for (int x = 0; x < NPX; x++) {
+    int k = x < nx ? (px[x] - floorDbm) * 63 / 40 : 0;
+    row[x] = sweep::pal[k < 0 ? 0 : k > 63 ? 63 : k];
+  }
+  pushWaterfall();
+
+  if (!scanOn) {                                 // sweep only: logs the way SWEEP does
+    detlog::scan(mv, mg, n, floorDbm, top, t0);
+    if (detlog::total != shownTotal) { title(); panelHits(); }
+    return;
+  }
+  detlog::learn(mv, mg, n, top + detlog::OFF_DB);
+  int c = -1;
+  for (int k = 0; k < n; k++)
+    if (mv[k] >= top + detlog::ON_DB && (c < 0 || mv[k] > mv[c]) && !detlog::isSpur(mg[k]) && !scan::skipped(mg[k]))
+      c = k;
+  if (c < 0) return;
+  if (!scan::check(mg[c])) { rf::setBw(bw()); return; }
+  locked = true;
+  lockG = scan::lockG; lockFloor = scan::lockFloor; peak = scan::peak;
+  tStart = tLast = millis();
+  hits = wins = 1;
+  int khz = gKHz(lockG);
+  Serial.printf("SCAN lock %d.%03d MHz  %d dBm (floor %d)\n", khz / 1000, khz % 1000, peak, lockFloor);
+  panelFreq(khz, C_TEXT);
+  panelStatus("LOCKED", C_ALERT);
+  // A red line through spectrum and waterfall at the locked frequency (any zoom). The
+  // waterfall holds still while locked; the next sweep after the lock draws over it.
+  int lx = (lockG - vStart) / bpp;
+  if (lx >= 0 && lx < npx()) {
+    lcd.drawFastVLine(X0 + lx, SPEC_Y, SPEC_H, C_ALERT);
+    lcd.drawFastVLine(X0 + lx, WF_Y, WF_H, C_ALERT);
+  }
+}
+
+void loop() {
+  if (pendingDrag.valid) {                       // drag on the picture: pan
+    pendingDrag.valid = false;
+    if (pendingDrag.y0 >= SPEC_Y && pendingDrag.y0 < BAR_Y - 4 && bpp < ZOOMS[NZOOM - 1])
+      setView(vStart - pendingDrag.dx * bpp, bpp);
+    return;
+  }
+  if (tapped()) {
+    int x = pendingTap.x, y = pendingTap.y;
+    if (y >= BAR_Y - 4) {
+      for (int i = 0; i < 7; i++) if (x >= BX[i] - 1 && x < BX[i] + BWD[i] + 1) button(i);
+    } else if (x >= PX0 - 3) {
+      if (locked) { Serial.println("SCAN skip"); endLock(true); }
+    } else if (y >= SPEC_Y && y < SPEC_Y + SPEC_H) {
+      for (int i = 0; i < NPX; i++) hold[i] = px[i];
+    }
+    return;
+  }
+  if (locked) listen(); else sweepRow();
+}
+
+}  // namespace land
+#endif
+
 // ================================================================ TX
 // Test transmitter as a sound board: 8 pads, tap one to send it, tap again or BOOT to
 // stop. The SX1278 has no audio input, so the audio is made in software: the radio sends
@@ -1636,7 +2044,9 @@ uint32_t halfUs(int midi) { return HALF_US4[midi % 12] >> (midi / 12 - 5) ; }   
 // Layout: frequency and power buttons, a status line, then 2 x 4 pads.
 const int TOP_Y = UI_HDR_H + 6, TOP_H = 32, FREQ_W = 142, POW_X = 6 + FREQ_W + 6;
 const int STATUS_Y = TOP_Y + TOP_H + 5;
-const int PAD_Y = STATUS_Y + 20, PAD_W = (SCR_W - 18) / 2, PAD_H = 40, PAD_P = 46;
+const int PAD_C = SCR_W > 240 ? 4 : 2;            // columns: 4 x 2 landscape, 2 x 4 portrait
+const int PAD_Y = STATUS_Y + 20, PAD_W = (SCR_W - 6 * (PAD_C + 1)) / PAD_C;
+const int PAD_H = SCR_W > 240 ? 62 : 40, PAD_P = PAD_H + 6;
 
 void load() {
   fKHz = constrain((int)prefs.getUInt("txf", fKHz), F_MIN, F_MAX);
@@ -1654,13 +2064,13 @@ void drawTop() {
   uiButton(POW_X, TOP_Y, SCR_W - 6 - POW_X, TOP_H, b, C_PANEL, C_ACCENT, C_TEXT);
 }
 void drawPad(int i, bool on) {
-  uiButton(6 + i % 2 * (PAD_W + 6), PAD_Y + i / 2 * PAD_P, PAD_W, PAD_H, PADS[i],
+  uiButton(6 + i % PAD_C * (PAD_W + 6), PAD_Y + i / PAD_C * PAD_P, PAD_W, PAD_H, PADS[i],
            on ? C_ALERT : C_PANEL, on ? C_ALERT : C_HILITE, C_TEXT);
 }
 int padAt(int x, int y) {
   int c = (x - 6) / (PAD_W + 6), r = (y - PAD_Y) / PAD_P;
-  if (y < PAD_Y || x < 6 || c > 1 || r > 3 || (y - PAD_Y) % PAD_P >= PAD_H) return -1;
-  return r * 2 + c;
+  if (y < PAD_Y || x < 6 || c >= PAD_C || r >= NUM_SND / PAD_C || (y - PAD_Y) % PAD_P >= PAD_H) return -1;
+  return r * PAD_C + c;
 }
 void status(const char *s, uint16_t c) {
   lcd.setFont(&fonts::Font2);
@@ -1674,7 +2084,11 @@ void status(const char *s, uint16_t c) {
 void drawAll() {
   glowOff();
   lcd.fillScreen(C_BG);
+#ifdef HAN_LANDSCAPE
+  uiHeader("TX  sound board", "Back");
+#else
   uiHeader("TX  sound board", "Menu");
+#endif
   drawTop();
   status("Tap a pad to transmit", C_DIM);
   for (int i = 0; i < NUM_SND; i++) drawPad(i, false);
@@ -1685,7 +2099,7 @@ void drawAll() {
 void pickFreq() {
   static const char *const lab[8] = {"-1M", "-100k", "+100k", "+1M", "-25k", "-5k", "+5k", "+25k"};
   static const int step[8] = {-1000, -100, 100, 1000, -25, -5, 5, 25};
-  const int bw = (SCR_W - 5 * 8) / 4, bh = 40, by = 150, oky = SCR_H - 48;
+  const int bw = (SCR_W - 5 * 8) / 4, bh = 40, by = SCR_H > 240 ? 150 : 98, oky = SCR_H - 48;
   int v = fKHz;
   glowOff();
   lcd.fillScreen(C_BG);
@@ -1693,7 +2107,7 @@ void pickFreq() {
   lcd.setFont(&fonts::Font2);
   lcd.setTextColor(C_DIM, C_BG);
   lcd.setTextDatum(middle_center);
-  lcd.drawString("430.000 - 439.995 MHz", SCR_W / 2, 50);
+  lcd.drawString("430.000 - 439.995 MHz", SCR_W / 2, SCR_H > 240 ? 50 : 44);
   for (int i = 0; i < 8; i++)
     uiButton(8 + i % 4 * (bw + 8), by + i / 4 * (bh + 8), bw, bh, lab[i], C_PANEL, C_PANEL, C_TEXT);
   uiButton(8, oky, SCR_W - 16, 38, "OK", C_HILITE, C_ACCENT, C_TEXT);
@@ -1705,7 +2119,7 @@ void pickFreq() {
     lcd.setTextColor(C_TEXT, C_BG);
     lcd.setTextDatum(middle_center);
     lcd.setTextPadding(SCR_W - 8);
-    lcd.drawString(b, SCR_W / 2, 100);
+    lcd.drawString(b, SCR_W / 2, SCR_H > 240 ? 100 : 70);
     lcd.setTextSize(1);
     lcd.setTextPadding(0);
     lcd.setTextDatum(top_left);
@@ -1907,6 +2321,28 @@ void loop() {
 enum Mode { MODE_METER, MODE_SWEEP, MODE_SCAN, MODE_TX };
 static Mode mode = MODE_METER, rxMode = MODE_METER;
 
+#ifdef HAN_LANDSCAPE
+// Landscape has two screens: the combined one (kept as MODE_SCAN) and TX. Asking for
+// SWEEP or SCAN turns the scanner off or on there; METER just means the combined screen.
+static void leaveMode(Mode m) { if (m == MODE_TX) tx::leave(); else land::leave(); }
+static void enterMode(Mode m) {
+  pendingTap.valid = pendingDrag.valid = false;
+  if (m == MODE_TX) { mode = m; tx::enter(); return; }
+  if (m == MODE_SWEEP) land::scanOn = false;
+  if (m == MODE_SCAN) land::scanOn = true;
+  mode = rxMode = MODE_SCAN;
+  land::enter();
+}
+static void switchMode(Mode m) {
+  if (m != MODE_TX && mode != MODE_TX) {         // already on the combined screen
+    if (m == MODE_SWEEP || m == MODE_SCAN) land::setScan(m == MODE_SCAN);
+    return;
+  }
+  if (m == mode) return;
+  leaveMode(mode);
+  enterMode(m);
+}
+#else
 static void leaveMode(Mode m) {
   if (m == MODE_METER) meter::leave(); else if (m == MODE_SWEEP) sweep::leave();
   else if (m == MODE_SCAN) scan::leave(); else tx::leave();
@@ -1923,6 +2359,7 @@ static void switchMode(Mode m) {
   leaveMode(mode);
   enterMode(m);
 }
+#endif
 
 // The RX header Menu: the three screens, then band presets (they open in SWEEP).
 static void rxMenu() {
@@ -1957,12 +2394,22 @@ static bool queuedBoot, queuedLog;
 
 static void printStatus() {
   static const char *const M[] = {"meter", "sweep", "scan", "tx"};
+#ifdef HAN_LANDSCAPE
+  int a = gKHz(land::vStart), b = gKHz(min(GBINS, land::vStart + land::NPX * land::bpp));
+  int lg = max(0, land::lockG);
+  Serial.printf("STATUS landscape %s  view %d.%02d-%d.%02d MHz x%d  scan %s%s %d.%03d  %s  tx %d.%03d MHz %d dBm  "
+                "logged %lu  sd %d  heap %u\n", mode == MODE_TX ? "tx" : "main", a / 1000, a % 1000 / 10,
+                b / 1000, b % 1000 / 10, land::bpp, land::scanOn ? "on" : "off", land::locked ? " locked" : "",
+                gKHz(lg) / 1000, gKHz(lg) % 1000, land::slow ? "slow" : "fast", tx::fKHz / 1000, tx::fKHz % 1000,
+                tx::POWERS[tx::powIdx], (unsigned long)detlog::total, sdOk, (unsigned)ESP.getFreeHeap());
+#else
   int a = gKHz(sweep::vStart), b = gKHz(min(GBINS, sweep::vStart + sweep::NPX * sweep::bpp));
   Serial.printf("STATUS mode %s  sweep %d.%02d-%d.%02d MHz x%d  scan %s %d.%03d  tx %d.%03d MHz %d dBm  "
                 "logged %lu  sd %d  heap %u\n", M[mode], a / 1000, a % 1000 / 10, b / 1000, b % 1000 / 10,
                 sweep::bpp, scan::locked ? "locked" : "scanning", gKHz(scan::lockG) / 1000,
                 gKHz(scan::lockG) % 1000, tx::fKHz / 1000, tx::fKHz % 1000, tx::POWERS[tx::powIdx],
                 (unsigned long)detlog::total, sdOk, (unsigned)ESP.getFreeHeap());
+#endif
 }
 
 static void serialCommands() {
@@ -2043,7 +2490,11 @@ void setup() {
   pinMode(PIN_BOOT, INPUT_PULLUP);
 
   lcd.init();
+#ifdef HAN_LANDSCAPE
+  lcd.setRotation(LAND_ROT);
+#else
   lcd.setRotation(2);                  // portrait, same as H@N-CYD-GBC on this board
+#endif
   lcd.setBrightness(255);
 
   applyTheme(0);                       // H@N Night (han_ui.h)
@@ -2089,7 +2540,11 @@ void setup() {
     fatal(buf, "Check the NSS and MISO wires");
   }
 
+#ifdef HAN_LANDSCAPE
+  enterMode(MODE_SCAN);
+#else
   meter::enter();
+#endif
 }
 
 void loop() {
@@ -2102,6 +2557,10 @@ void loop() {
   int boot = bootEvent();
   if (queuedBoot) { queuedBoot = false; boot = 1; }
   if (boot == 1) {                       // short press: METER -> SWEEP -> SCAN (in RX)
+#ifdef HAN_LANDSCAPE
+    if (mode != MODE_TX) land::setScan(!land::scanOn);   // landscape: Scan on/off
+    return;
+#endif
     if (mode != MODE_TX) switchMode(mode == MODE_METER ? MODE_SWEEP : mode == MODE_SWEEP ? MODE_SCAN : MODE_METER);
     return;
   }
@@ -2121,6 +2580,10 @@ void loop() {
   if (tapIsOnTabs()) {                   // navigation: header button or RX/TX tabs
     pendingTap.valid = false;
     if (pendingTap.y < TAB_Y) {          // header button: the tab's menu
+#ifdef HAN_LANDSCAPE
+      switchMode(mode == MODE_TX ? MODE_METER : MODE_TX);   // landscape: TX / Back
+      return;
+#endif
       if (mode == MODE_TX) tx::menu(); else rxMenu();
     } else {
       switchMode(pendingTap.x < SCR_W / 2 ? rxMode : MODE_TX);
@@ -2128,6 +2591,10 @@ void loop() {
     return;
   }
   uiTick();                              // header stars, edge shine, row glow
+#ifdef HAN_LANDSCAPE
+  if (mode == MODE_TX) tx::loop(); else land::loop();
+  return;
+#endif
   if (mode == MODE_METER) meter::loop();
   else if (mode == MODE_SWEEP) sweep::loop();
   else if (mode == MODE_SCAN) scan::loop();

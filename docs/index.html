@@ -55,11 +55,21 @@
       <li>Use desktop <strong>Chrome</strong> or <strong>Edge</strong> (they support Web Serial).</li>
       <li>Plug the board in by USB-C, then click below and pick its serial port.</li>
     </ul>
+    <p><strong>Portrait</strong>: separate Meter, Sweep and Scan screens with RX/TX tabs.</p>
     <esp-web-install-button manifest="firmware/manifest-crowpanel.json">
-      <button class="btn" slot="activate">Flash my board</button>
+      <button class="btn" slot="activate">Flash portrait</button>
       <span slot="unsupported" class="unsupported">Your browser can't flash - open this page in desktop Chrome or Edge.</span>
       <span slot="not-allowed" class="unsupported">This page must be served over https to flash.</span>
     </esp-web-install-button>
+    <p><strong>Landscape</strong> (cables at the bottom): one screen with the spectrum,
+    waterfall and scanner together, plus the TX sound board.</p>
+    <esp-web-install-button manifest="firmware/manifest-crowpanel-landscape.json">
+      <button class="btn" slot="activate">Flash landscape</button>
+      <span slot="unsupported" class="unsupported">Your browser can't flash - open this page in desktop Chrome or Edge.</span>
+      <span slot="not-allowed" class="unsupported">This page must be served over https to flash.</span>
+    </esp-web-install-button>
+    <p><strong>For research purposes only.</strong> Only transmit where you are licensed or
+    permitted to, and follow your local radio regulations.</p>
   </div>
 
   <h3>What this build does</h3>

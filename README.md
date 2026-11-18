@@ -4,7 +4,15 @@ A 433 MHz LoRa listener, scanner and band logger for the Elecrow CrowPanel ESP32
 "ESP32 Solo Miner LCD" board (SKU `DHM04624D`) with an Ai-Thinker **Ra-01 (SX1278)**
 radio wired to it.
 
+> **FOR RESEARCH PURPOSES ONLY.** This is an experimental receiver and test transmitter.
+> Only transmit on frequencies and at power levels you are licensed or permitted to use,
+> and follow your local radio regulations. You are responsible for how you use it.
+
 > Working name - the repo can be renamed later if this grows past a scanner.
+
+Two builds from the same source: **portrait** (Meter / Sweep / Scan screens, RX/TX tabs) and
+**landscape** (`LANDSCAPE=1 tools/build.sh`; one screen with spectrum, waterfall and
+scanner together - "scan what you see" - and the TX sound board).
 
 **Flash it from your browser:** <https://hackatnight.com/HAN-433-LoRa-Scanner/>
 

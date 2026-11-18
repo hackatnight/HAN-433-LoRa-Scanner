@@ -43,13 +43,15 @@ jobs:
 
       - name: Build and merge into one flashable image
         working-directory: HAN-433-LoRa-Scanner
-        run: bash tools/build.sh
+        run: |
+          bash tools/build.sh
+          LANDSCAPE=1 bash tools/build.sh
 
       - name: Commit the built firmware
         working-directory: HAN-433-LoRa-Scanner
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/firmware/HAN-433-Scanner.bin
+          git add docs/firmware/HAN-433-Scanner.bin docs/firmware/HAN-433-Scanner-Landscape.bin
           git commit -m "CI: build scanner firmware [skip ci]" || echo "nothing to commit"
           git push
