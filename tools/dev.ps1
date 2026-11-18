@@ -12,7 +12,7 @@ param(
   [switch]$Flash,
   [int]$Log = 0,
   [string]$Port = 'COM4',
-  [string]$Match = 'TOUCH|CAL|SWEEP|METER|Radio|saved|loaded|calibration|rror|Guru|panic|rst:'
+  [string]$Match = 'TOUCH|CAL|SWEEP|METER|Radio|saved|loaded|calibration|TIME|DET|LOG|rror|Guru|panic|rst:'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
@@ -35,11 +35,15 @@ if ($Log -gt 0) {
   $p = New-Object System.IO.Ports.SerialPort $Port, 115200
   $p.DtrEnable = $false; $p.RtsEnable = $false
   $p.Open()
+  # The board has no clock: send it ours ("T<unix ms>") now, and again when it boots.
+  $sendTime = { $p.Write("T$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())`n") }
+  & $sendTime
   $buf = ''; $rssi = @(); $end = (Get-Date).AddSeconds($Log)
   while ((Get-Date) -lt $end) {
     $buf += $p.ReadExisting()
     while (($i = $buf.IndexOf("`n")) -ge 0) {
       $line = $buf.Substring(0, $i).Trim(); $buf = $buf.Substring($i + 1)
+      if ($line -match '^H@N 433MHz') { & $sendTime }
       if ($line -match '^RSSI: (-?[\d.]+)') { $rssi += [double]$Matches[1] }
       elseif ($line -match $Match) { $line }
     }

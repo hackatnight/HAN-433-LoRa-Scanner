@@ -8,9 +8,11 @@
 //          peak.
 //   SWEEP  Steps across 430.00-439.95 MHz and draws a spectrum (with a max-hold
 //          trace) over a scrolling waterfall - "what's in my air". Tap to clear
-//          the max hold.
+//          the max hold. Signals that rise above the noise floor are logged to
+//          the SD card (/han433_det.csv) with frequency, peak, duration and time.
 //
-// Both also report over USB serial at 115200 baud.
+// Both also report over USB serial at 115200 baud. Sending "T<unix ms>" over serial
+// sets the clock (tools/dev.ps1 does it); without it the log has uptime only.
 //
 // Board: Elecrow CrowPanel 2.4" "ESP32 Solo Miner LCD" (SKU DHM04624D).
 //
@@ -29,6 +31,7 @@
 #include <SD.h>
 #include <Preferences.h>
 #include "soc/spi_reg.h"
+#include "soc/gpio_sig_map.h"
 
 // ---------------------------------------------------------------- radio
 #define PIN_SCK   25
@@ -192,7 +195,11 @@ static void drawTabs(int active) {   // 0 = METER, 1 = SWEEP
 // Hold BOOT for 2 s at any time to restart into calibration.
 //
 // The SD card is on VSPI pins 18/19/23/5 - the same SPI peripheral the radio uses on
-// its own pins. So the card is only touched in setup(), before the radio starts.
+// its own pins 25/21/32/22. The card is mounted once in setup() and stays mounted;
+// sdBus() moves the peripheral's signals between the two pin sets through the GPIO
+// matrix. While the radio has the bus, the card's SCK/MOSI pins sit idle as plain GPIO
+// outputs: left attached, every radio transfer also drove the SD slot's traces, which
+// radiated SPI clock harmonics into the 433 band (spurs every few MHz in the sweep).
 #define PIN_SD_SCK   18
 #define PIN_SD_MISO  19
 #define PIN_SD_MOSI  23
@@ -216,12 +223,26 @@ static bool rawToScreen(int rx, int ry, int &sx, int &sy) {
 
 static SPIClass sdSPI(VSPI);
 
+static bool sdOk = false;   // card mounted (in setup)
+
+// true: VSPI SCK/MOSI out on the card's pins, MISO in from the card. false: card pins
+// idle, MISO in from the radio. The radio's own SCK/MOSI stay attached (CS high = ignored).
+static void sdBus(bool on) {
+  if (on) {
+    pinMatrixOutAttach(PIN_SD_SCK, VSPICLK_OUT_IDX, false, false);
+    pinMatrixOutAttach(PIN_SD_MOSI, VSPID_OUT_IDX, false, false);
+  } else {
+    pinMatrixOutDetach(PIN_SD_SCK, false, false);
+    pinMatrixOutDetach(PIN_SD_MOSI, false, false);
+  }
+  pinMatrixInAttach(on ? PIN_SD_MISO : PIN_MISO, VSPIQ_IN_IDX, false);
+}
+
 static bool sdOpen() {
   sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   if (!SD.begin(PIN_SD_CS, sdSPI)) { sdSPI.end(); return false; }
   return true;
 }
-static void sdClose() { SD.end(); sdSPI.end(); }
 
 static bool parseCal(const String &line) {
   TouchCal c;
@@ -243,11 +264,10 @@ static String calLine() {
 
 // Returns where it was loaded from, or nullptr.
 static const char *loadCal() {
-  if (sdOpen()) {
+  if (sdOk) {
     bool ok = false;
     File f = SD.open(CAL_FILE, FILE_READ);
     if (f) { ok = parseCal(f.readStringUntil('\n')); f.close(); }
-    sdClose();
     if (ok) return "SD card";
   }
   String s = prefs.getString("cal", "");
@@ -259,15 +279,14 @@ static const char *loadCal() {
 static const char *saveCal() {
   String line = calLine();
   prefs.putString("cal", line);
-  bool sdOk = false;
-  if (sdOpen()) {
+  bool saved = false;
+  if (sdOk) {
     File f = SD.open(CAL_FILE, FILE_WRITE);
-    if (f) { f.println(line); f.close(); sdOk = true; }
-    sdClose();
+    if (f) { f.println(line); f.close(); saved = true; }
   }
   Serial.printf("Touch calibration saved (%s): %s\n",
-                sdOk ? "SD card + flash" : "flash only, no SD card", line.c_str());
-  return sdOk ? "SD card" : "flash (no SD card found)";
+                saved ? "SD card + flash" : "flash only, no SD card", line.c_str());
+  return saved ? "SD card" : "flash (no SD card found)";
 }
 
 // ---- ported from H@N-CYD-GBC (src/main.cpp), proven on this board -------------
@@ -698,6 +717,203 @@ void loop() {
 
 }  // namespace meter
 
+// ================================================================ DETECTION LOG
+// The 2-sample RSSI is noisy: ~10% of bins sit 10+ dB over the floor (25th percentile)
+// in quiet air. So thresholds hang off each sweep's "noise top" instead - its 95th
+// percentile (10th-loudest bin). A detection = a run of bins at least ON_DB over the
+// noise top, seen again in the very next sweep. It stays open while a run within NEAR bins
+// of where it started stays OFF_DB over the noise top - the bin never moves, so it
+// can't wander from spike to spike - and ends after MISS sweeps without one. The logged
+// SNR is relative to the floor. Ended detections are printed over
+// serial ("DET ...") and kept in RAM, then appended to the SD card in batches between
+// sweeps: when FLUSH_N are waiting or the oldest has waited FLUSH_MS.
+//
+// Time: every row has the boot number (NVS counter) and uptime in ms. Once the PC has
+// sent "T<unix ms>" over serial, rows also get UTC - including rows still in RAM.
+namespace detlog {
+
+const int ON_DB = 6, OFF_DB = 1;     // dB over the noise top to open / to stay open
+// The ESP32's 40 MHz crystal x 11 = 440.000 MHz: its skirt fills 439.60-439.95 on every
+// unit and comes and goes, so those bins are shown but not scanned for detections.
+const int SPUR_BIN = 192;            // 439.60 MHz
+// Other spurs (this board: 432.05, 436.7, 437.95, 438.35) are learned: busy[i] is how
+// often bin i is over the stay-open level, averaged over ~2048 sweeps (~95 s), 65535 =
+// always. A bin counts as quiet - a spur, or a steady local emitter - when it or a
+// neighbor is busier than SPUR_BUSY (a spur's skirt flickers less than its center).
+// Spurs here flicker at 5-15%; a 2 s burst only lifts busy to ~2%. Learning is slow on
+// purpose (a fast learner takes an early real signal for a spur), so the learned bins
+// are kept on the SD card as a 200-bit map and loaded at boot: only the first run on a
+// card has a warm-up (a minute or two of spur rows).
+const int32_t SPUR_BUSY = 65535 * 5 / 100;
+uint16_t busy[SWEEP_BINS];
+uint8_t spurMap[SWEEP_BINS / 8];     // learned spur bins, as last saved / loaded
+bool spurDirty;                      // the learned bins differ from spurMap
+uint32_t spurSaved;                  // millis() of the last save
+const uint32_t SPUR_SAVE_MS = 60000;
+const char *SPUR_FILE = "/han433_spur.bin";
+const int MISS = 2;                  // sweeps a signal may drop out before it ends
+const int NEAR = 3;                  // a run within 3 bins (150 kHz) continues a detection
+// A transmitter close by overloads the front end and shows sidelobes up to ~1 MHz out,
+// 30-40 dB down: a run SIDE_DB under the loudest bin within SIDE bins is ignored.
+const int SIDE = 20, SIDE_DB = 25;
+const uint32_t MAX_MS = 60000;       // a carrier that never stops: one row a minute
+const int NOPEN = 8, NBUF = 32, FLUSH_N = 16;
+const uint32_t FLUSH_MS = 30000;
+const char *FILE_NAME = "/han433_det.csv";
+
+// at = bin it opened on (fixed), bin = loudest bin; ok = confirmed (seen 2 sweeps running)
+struct Det { uint32_t t0, t1; int16_t bin, at, peak, snr; uint16_t sweeps; uint8_t miss; bool ok; };
+Det act[NOPEN], buf[NBUF];
+int nOpen, nBuf, hot, spurs;         // last sweep: bins over the open level / learned spurs
+uint32_t total, dropped, boot, pendSince;
+int64_t utcOffMs;                    // unix ms - millis(); 0 = clock not set
+
+// "2026-11-18T14:03:22.123Z", or "" before the clock is set.
+void utc(char *s, uint32_t ms) {
+  *s = 0;
+  if (!utcOffMs) return;
+  int64_t e = utcOffMs + ms;
+  time_t sec = e / 1000;
+  struct tm t;
+  gmtime_r(&sec, &t);
+  sprintf(s, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", t.tm_year + 1900, t.tm_mon + 1,
+          t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, (int)(e % 1000));
+}
+
+void setClock(uint64_t unixMs) {
+  utcOffMs = (int64_t)unixMs - millis();
+  char s[28];
+  utc(s, millis());
+  Serial.printf("TIME set %s\n", s);
+}
+
+void emit(const Det &d) {
+  if (!d.sweeps) return;
+  int khz = 430000 + d.bin * 50;
+  Serial.printf("DET %d.%03d MHz  %d dBm  +%d dB  %lu ms  %u sweeps\n", khz / 1000, khz % 1000,
+                d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.sweeps);
+  total++;
+  if (!sdOk) return;
+  if (nBuf == NBUF) { dropped++; return; }
+  if (!nBuf) pendSince = millis();
+  buf[nBuf++] = d;
+}
+
+// After each sweep: the bins in dBm, the sweep's floor and noise top, its start time.
+void scan(const int16_t *bins, int n, int floor, int top, uint32_t now) {
+  const int on = top + ON_DB, off = top + OFF_DB;
+  bool seen[NOPEN] = {};
+  bool lit[SWEEP_BINS];                                     // over off, and not a spur
+  hot = spurs = 0;
+  for (int i = 0; i < n; i++) {
+    busy[i] += ((bins[i] >= off ? 65535 : 0) - (int32_t)busy[i]) >> 11;
+    uint8_t bit = 1 << (i & 7), &m = spurMap[i >> 3];
+    if ((busy[i] > SPUR_BUSY) != !!(m & bit)) { m ^= bit; spurDirty = true; }
+  }
+  for (int i = 0; i < n; i++) {
+    bool spur = busy[i] > SPUR_BUSY || (i && busy[i - 1] > SPUR_BUSY) ||
+                (i < n - 1 && busy[i + 1] > SPUR_BUSY);
+    spurs += spur;
+    lit[i] = bins[i] >= off && !spur;
+    hot += lit[i] && bins[i] >= on;
+  }
+  for (int i = 0; i < n;) {
+    if (!lit[i]) { i++; continue; }
+    int r0 = i, p = i;                                      // run r0..i-1, peak bin p
+    for (; i < n && lit[i]; i++) if (bins[i] > bins[p]) p = i;
+    int big = bins[p];                                      // loudest within +-1 MHz
+    for (int j = p < SIDE ? 0 : p - SIDE; j <= p + SIDE && j < n; j++) if (bins[j] > big) big = bins[j];
+    if (bins[p] <= big - SIDE_DB) continue;                 // a strong neighbor's sidelobe
+    int k = 0;
+    while (k < nOpen && (act[k].at < r0 - NEAR || act[k].at > i - 1 + NEAR)) k++;
+    if (k == nOpen) {                                       // a new signal?
+      if (bins[p] < on || nOpen == NOPEN) continue;
+      act[nOpen++] = {now, now, (int16_t)p, (int16_t)p, -128, 0, 0, 0, false};
+    }
+    Det &d = act[k];
+    if (!seen[k]) { seen[k] = true; d.t1 = now; d.ok |= ++d.sweeps >= 2; d.miss = 0; }
+    if (bins[p] > d.peak) { d.peak = bins[p]; d.bin = p; d.snr = bins[p] - floor; }
+  }
+  for (int k = 0; k < nOpen;) {
+    Det &d = act[k];
+    if (!seen[k] && (!d.ok || ++d.miss > MISS)) {           // gone: log it if confirmed
+      if (d.ok) emit(d);
+      act[k] = act[--nOpen]; seen[k] = seen[nOpen];
+      continue;
+    }
+    if (now - d.t0 >= MAX_MS) {                             // still there after a minute
+      emit(d);
+      d.t0 = d.t1 = now; d.sweeps = 0; d.peak = -128;
+    }
+    k++;
+  }
+}
+
+// Setup, SD card mounted: start from the spurs learned last time.
+void loadSpurs() {
+  File f = SD.open(SPUR_FILE, FILE_READ);
+  if (!f) return;
+  int got = f.read(spurMap, sizeof spurMap);
+  f.close();
+  if (got != sizeof spurMap) { memset(spurMap, 0, sizeof spurMap); return; }
+  int n = 0;
+  for (int i = 0; i < SWEEP_BINS; i++)
+    if (spurMap[i >> 3] & 1 << (i & 7)) { busy[i] = SPUR_BUSY * 2; n++; }
+  Serial.printf("LOG %d spur bins loaded from SD card\n", n);
+}
+
+// Main loop, between sweeps: hands the bus to the card, appends the waiting rows and/or
+// saves the spur map, hands the bus back.
+void flush() {
+  bool rows = nBuf && (nBuf >= FLUSH_N || millis() - pendSince >= FLUSH_MS);
+  bool spur = sdOk && spurDirty && millis() - spurSaved >= SPUR_SAVE_MS;
+  if (!rows && !spur) return;
+  uint32_t t = millis();
+  sdBus(true);
+  if (spur) {
+    File s = SD.open(SPUR_FILE, FILE_WRITE);
+    bool ok = s;
+    if (ok) { s.write(spurMap, sizeof spurMap); s.close(); }
+    Serial.printf("LOG spur map %s\n", ok ? "saved to SD card" : "save FAILED");
+    spurDirty = false;
+    spurSaved = millis();
+  }
+  if (!rows) { sdBus(false); return; }
+  File f = SD.open(FILE_NAME, FILE_APPEND);
+  bool ok = f;
+  if (ok) {
+    if (!f.size()) f.println("boot,uptime_ms,utc,freq_mhz,peak_dbm,snr_db,dur_ms,sweeps");
+    char s[28];
+    for (int k = 0; k < nBuf; k++) {
+      const Det &d = buf[k];
+      int khz = 430000 + d.bin * 50;
+      utc(s, d.t0);
+      f.printf("%lu,%lu,%s,%d.%03d,%d,%d,%lu,%u\n", (unsigned long)boot, (unsigned long)d.t0, s,
+               khz / 1000, khz % 1000, d.peak, d.snr, (unsigned long)(d.t1 - d.t0), d.sweeps);
+    }
+    f.close();
+  } else dropped += nBuf;
+  sdBus(false);
+  Serial.printf("LOG %s %d rows in %lu ms (%lu logged, %lu dropped)\n", ok ? "wrote" : "FAILED",
+                nBuf, (unsigned long)(millis() - t), (unsigned long)total, (unsigned long)dropped);
+  nBuf = 0;
+}
+
+// "T<unix ms>" + newline from the PC sets the clock.
+void pollSerial() {
+  static char line[24];
+  static uint8_t n;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { if (n < sizeof line - 1) line[n++] = c; continue; }
+    line[n] = 0;
+    if (n > 10 && line[0] == 'T') setClock(strtoull(line + 1, nullptr, 10));
+    n = 0;
+  }
+}
+
+}  // namespace detlog
+
 // ================================================================ SWEEP
 namespace sweep {
 
@@ -718,7 +934,7 @@ const uint8_t MADCTL_SWEEP = 0xC8, MADCTL_ROT2 = 0xDC;   // MY|MX|BGR (+ML|MH)
 int16_t bins[SWEEP_BINS], hold[SWEEP_BINS];
 uint16_t pal[64];
 int floorDbm = -120, vsp = TFA, wfRow;   // wfRow = memory row being drawn this sweep
-uint32_t sweepCount;
+uint32_t sweepCount, shownTotal;
 // The sweep runs the radio in FSK mode: its RSSI is smoothed over just 2 samples and the
 // receiver can be relocked onto a new frequency with one register write, so a reading is
 // valid ~0.2 ms after a retune. LoRa mode's RSSI is averaged far longer, which smeared
@@ -794,6 +1010,7 @@ void enter() {
 
   for (int i = 0; i < SWEEP_BINS; i++) hold[i] = -130;
   sweepCount = 0;
+  shownTotal = ~0u;   // redraw the log count
 
   lcd.fillScreen(C_BG);
   drawHeader("SWEEP");
@@ -864,6 +1081,22 @@ bool loop() {
   }
   for (int v = 0, n = 0; v < 136; v++) if ((n += cnt[v]) >= SWEEP_BINS / 4) { floorDbm = v - 140; break; }
 
+  int top = 135;                          // noise top: 95th percentile, 10th-loudest bin
+  for (int n = 0; top > 0 && (n += cnt[top]) < SWEEP_BINS / 20; top--) {}
+  top -= 140;
+  detlog::scan(bins, detlog::SPUR_BIN, floorDbm, top, t0);
+  if (detlog::total != shownTotal) {      // header, right: detections so far
+    shownTotal = detlog::total;
+    char s[20];
+    snprintf(s, sizeof s, sdOk ? "%lu logged" : "%lu det, no SD", (unsigned long)shownTotal);
+    lcd.setFont(&fonts::Font2);
+    lcd.setTextDatum(middle_right);
+    lcd.setTextColor(sdOk ? C_TEXT : C_ALERT, C_PANEL);
+    lcd.setTextPadding(100);
+    lcd.drawString(s, SCR_W - 8, 13);
+    lcd.setTextPadding(0);
+  }
+
   if (tapped()) for (int i = 0; i < SWEEP_BINS; i++) hold[i] = bins[i];
 
   char b[40];
@@ -877,7 +1110,8 @@ bool loop() {
   lcd.setTextPadding(0);
 
   if (++sweepCount % 10 == 0)
-    Serial.printf("SWEEP %lu ms  floor %d dBm  peak %s\n", (unsigned long)dt, floorDbm, b + 5);
+    Serial.printf("SWEEP %lu ms  floor %d  top %d dBm  hot %d  spurs %d  peak %s\n",
+                  (unsigned long)dt, floorDbm, top, detlog::hot, detlog::spurs, b + 5);
   return true;
 }
 
@@ -913,10 +1147,16 @@ void setup() {
   C_ALERT  = lcd.color565(255, 70, 90);
   sweep::buildPalette();
 
-  // Touch calibration, before the radio starts (the SD card shares its SPI peripheral).
-  // Runs on the first boot, or after BOOT was held 2 s (which sets "recal" and restarts).
+  // Touch calibration. Runs on the first boot, or after BOOT was held 2 s (which sets
+  // "recal" and restarts).
   { uint8_t d[57]; xptRead(d); }   // re-arm the touch chip's pen interrupt
   prefs.begin("han433", false);
+  sdOk = sdOpen();                 // stays mounted; shares VSPI with the radio
+  detlog::boot = prefs.getUInt("boot", 0) + 1;
+  prefs.putUInt("boot", detlog::boot);
+  Serial.printf("LOG boot %lu, SD card %s\n", (unsigned long)detlog::boot,
+                sdOk ? "mounted" : "not found - detections go to serial only");
+  if (sdOk) detlog::loadSpurs();
   const char *calFrom = loadCal();
   bool recal = prefs.getBool("recal", false);
   if (calFrom) Serial.printf("Touch calibration loaded from %s\n", calFrom);
@@ -929,6 +1169,7 @@ void setup() {
   drawHeader("");
 
   radioSPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_NSS);
+  if (sdOk) sdBus(false);              // card pins idle until a log flush
 
   // begin() resets (skipped here - RST is NC), reads the chip version, and sets
   // default LoRa parameters.
@@ -948,6 +1189,8 @@ void setup() {
 }
 
 void loop() {
+  detlog::pollSerial();
+  detlog::flush();
   int boot = bootEvent();
   if (boot == 1) {                       // short press: switch mode
     switchMode(mode == MODE_METER ? MODE_SWEEP : MODE_METER);
