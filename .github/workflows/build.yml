@@ -1,0 +1,53 @@
+name: build firmware
+
+# Builds the scanner firmware on GitHub's servers and commits the merged .bin into
+# docs/firmware/, where the web flasher picks it up. This is why no local toolchain
+# is needed: push a source change, and a minute or two later the flasher is updated.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'platformio.ini'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO and esptool
+        run: pip install platformio esptool
+
+      - name: Build
+        run: pio run -e crowpanel-miner
+
+      - name: Merge into one flashable image
+        run: |
+          B=.pio/build/crowpanel-miner
+          BOOT_APP0=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
+          python -m esptool --chip esp32 merge_bin \
+            -o docs/firmware/HAN-433-Scanner.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 "$B/bootloader.bin" \
+            0x8000 "$B/partitions.bin" \
+            0xe000 "$BOOT_APP0" \
+            0x10000 "$B/firmware.bin"
+
+      - name: Commit the built firmware
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/firmware/HAN-433-Scanner.bin
+          git commit -m "CI: build scanner firmware [skip ci]" || echo "nothing to commit"
+          git push
