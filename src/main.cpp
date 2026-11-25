@@ -1054,6 +1054,52 @@ void tail(int n) {
 
 }  // namespace detlog
 
+// ================================================================ TIMING
+// "timing on" (serial or BLE) prints where the time goes every 2 s, to see what a second
+// core would win; "timing off" stops it. Off, it costs one bool test per hook.
+//   sweep  the radio pass of one spectrum row, start to last reading
+//   draw   a spectrum column drawn inside a step's PLL settle wait; "over" = steps where
+//          tuning + drawing outlasted the wait, so drawing made the sweep longer
+//   post   after the sweep: waterfall push, BLE spectrum, logging, text
+//   listen AM: batches that started late (the screen or BLE held the loop) and 8 kHz
+//          samples taken more than half a period late; FM: FIFO overruns (audio lost)
+//   tx     16 kHz ticks / note edges more than 30 us late
+namespace prof {
+bool on;
+struct Acc {
+  uint32_t n, sum, max;
+  void add(uint32_t us) { n++; sum += us; if (us > max) max = us; }
+};
+Acc sweep, post, draw, over, lisLate, lisSample, txLate;
+uint32_t fifoOver, lastPrint;
+void reset() { sweep = post = draw = over = lisLate = lisSample = txLate = Acc(); fifoOver = 0; lastPrint = millis(); }
+void set(bool v) { on = v; reset(); }
+// One column drawn inside a step: drawUs drawing it, stepUs from the step's start to now.
+void drawn(uint32_t drawUs, uint32_t stepUs, uint32_t dwell) {
+  draw.add(drawUs);
+  if (stepUs > dwell) over.add(stepUs - dwell);
+}
+void txTick(uint32_t lateUs) { if (lateUs > 30) txLate.add(lateUs); }
+static float avgMs(const Acc &a) { return a.n ? a.sum / 1000.0f / a.n : 0; }
+void tick() {
+  if (!on || millis() - lastPrint < 2000) return;
+  if (sweep.n)
+    con.printf("TIMING sweeps %lu  radio avg %.1f max %.1f ms  post avg %.1f max %.1f ms  "
+               "draws %lu avg %lu max %lu us  over-dwell %lu (+%.1f ms total, max %lu us)\n",
+               (unsigned long)sweep.n, avgMs(sweep), sweep.max / 1000.0f, avgMs(post), post.max / 1000.0f,
+               (unsigned long)draw.n, (unsigned long)(draw.n ? draw.sum / draw.n : 0), (unsigned long)draw.max,
+               (unsigned long)over.n, over.sum / 1000.0f, (unsigned long)over.max);
+  if (lisLate.n || lisSample.n || fifoOver)
+    con.printf("TIMING listen  late batches %lu (max %.1f ms)  late samples %lu (max %lu us)  fifo overruns %lu\n",
+               (unsigned long)lisLate.n, lisLate.max / 1000.0f, (unsigned long)lisSample.n,
+               (unsigned long)lisSample.max, (unsigned long)fifoOver);
+  if (txLate.n)
+    con.printf("TIMING tx  late ticks %lu  max %lu us  avg %lu us\n", (unsigned long)txLate.n,
+               (unsigned long)txLate.max, (unsigned long)(txLate.sum / txLate.n));
+  reset();
+}
+}  // namespace prof
+
 // ================================================================ SWEEP
 // A window onto the grid: NPX pixels from grid bin vStart, bpp grid bins per pixel
 // (zoom 1 / 2 / 3 / 5 / 12 = 10 / 20 / 30 / 50 / 115 MHz wide). The receiver widens with
@@ -1259,7 +1305,7 @@ void loop() {
     } else if (y >= SPEC_Y && y < BTN_Y) for (int i = 0; i < NPX; i++) hold[i] = px[i];
     return;
   }
-  uint32_t t0 = millis();
+  uint32_t t0 = millis(), t0us = micros();
   // New waterfall row: advance the scroll pointer, then the row that just wrapped to
   // the top (the oldest one) is the one to overwrite. Blank it first.
   wfRow = vsp;
@@ -1279,7 +1325,11 @@ void loop() {
       uint32_t t = micros();
       int g = pointBin(x, s);
       rf::tune(gKHz(g));
-      if (x && !s) drawPx(x - 1);
+      if (x && !s) {
+        uint32_t d0 = micros();
+        drawPx(x - 1);
+        if (prof::on) prof::drawn(micros() - d0, micros() - t, dwell);
+      }
       while (micros() - t < dwell) {}
       int v = rf::rssi();
       mv[n] = v; mg[n++] = g;
@@ -1293,7 +1343,8 @@ void loop() {
     }
   }
   drawPx(nx - 1);
-  uint32_t dt = millis() - t0;
+  uint32_t dt = millis() - t0, t1us = micros();
+  if (prof::on) prof::sweep.add(t1us - t0us);
 
   int top;
   rf::levels(mv, n, floorDbm, top);
@@ -1311,6 +1362,7 @@ void loop() {
   snprintf(b, sizeof b, "Peak %d.%02d MHz  %d dBm", khz / 1000, khz % 1000 / 10, mv[peak]);
   lcd.drawString(b, 8, UI_HDR_H + 3);
   lcd.setTextPadding(0);
+  if (prof::on) prof::post.add(micros() - t1us);
 
   if (++sweepCount % 10 == 0)
     con.printf("SWEEP %lu ms  floor %d  top %d dBm  hot %d  spurs %d  peak %s\n",
@@ -1928,7 +1980,7 @@ void leave() {
 
 // One sweep of the window, drawing as it goes; returns early on input.
 void sweepRow() {
-  uint32_t t0 = millis();
+  uint32_t t0 = millis(), t0us = micros();
   const int nx = npx(), ns = subs();
   const uint32_t dwell = bpp == 1 ? SWEEP_DWELL_US : bpp == 2 ? 150 : 120;
   rf::tune(gKHz(pointBin(0, 0)));
@@ -1940,7 +1992,11 @@ void sweepRow() {
       uint32_t t = micros();
       int g = pointBin(x, s);
       rf::tune(gKHz(g));
-      if (x && !s) drawCol(x - 1);
+      if (x && !s) {
+        uint32_t d0 = micros();
+        drawCol(x - 1);
+        if (prof::on) prof::drawn(micros() - d0, micros() - t, dwell);
+      }
       while (micros() - t < dwell) {}
       int v = rf::rssi();
       if (slow) {                                // Slow: average 4 reads, a steadier floor
@@ -1960,6 +2016,8 @@ void sweepRow() {
     }
   }
   drawCol(nx - 1);
+  uint32_t t1us = micros();
+  if (prof::on) prof::sweep.add(t1us - t0us);
   int top;
   rf::levels(mv, n, floorDbm, top);
 
@@ -1971,6 +2029,7 @@ void sweepRow() {
   }
   pushWaterfall();
   ble::spectrum(gKHz(vStart), bpp * G_STEP, px, nx);
+  if (prof::on) prof::post.add(micros() - t1us);   // the picture and the phone; logging/scan not counted
   if (lis) {                                     // a picture sweep while listening: a line there
     int lx = (lisKHz - gKHz(vStart)) / (bpp * G_STEP);
     if (lx >= 0 && lx < npx()) { lcd.drawFastVLine(X0 + lx, SPEC_Y, SPEC_H, C_ACCENT); lcd.drawFastVLine(X0 + lx, WF_Y, WF_H, C_ACCENT); }
@@ -2101,9 +2160,11 @@ void lisLoop() {
   }
   if (lisAm) {                                   // ~25 ms of RSSI samples at 8 kHz
     uint32_t t0 = millis();
+    if (prof::on && (int32_t)(micros() - lisNext) > 125) prof::lisLate.add(micros() - lisNext);
     if (micros() - lisNext > 20000) lisNext = micros();   // fell behind: start again
     while (millis() - t0 < 25) {
       while ((int32_t)(micros() - lisNext) < 0) {}
+      if (prof::on && micros() - lisNext > 62) prof::lisSample.add(micros() - lisNext);
       lisNext += 125;
       int v = rf::rssi();
       lisLevel = v;
@@ -2121,7 +2182,7 @@ void lisLoop() {
         radioSPI.beginTransaction(rf::fastSPI);
       }
     }
-    if (f2 & 0x10) rf::rw(0x3F, 0x10);           // FifoOverrun: clear it
+    if (f2 & 0x10) { rf::rw(0x3F, 0x10); prof::fifoOver++; }   // FifoOverrun: clear it
     int v = -(rf::rr(0x11) >> 1);
     lisLevel = v;
     if (!lisOpen && v >= lockFloor + 10) { lisOpen = true; rf::rw(0x0D, 0x18 | 0x40); }   // restart RX: AFC
@@ -2326,6 +2387,7 @@ bool playNote(int midi, int arp, uint32_t ms) {
     if (arp && millis() - aAt >= 33) { aAt = millis(); a = (a + 1) % 3; half = halfUs(midi + ARP[arp][a]); }
     if (!half) { delay(1); if (stopNow()) return false; continue; }
     while ((int32_t)(micros() - next) < 0) {}
+    if (prof::on) prof::txTick(micros() - next);
     next += half;
     hi = !hi;
     setFrf(frf0 + (hi ? SONG_DEV : -SONG_DEV));
@@ -2423,6 +2485,7 @@ void send(int s) {
       int d = tick(s, k);
       if (d == END) break;
       while ((int32_t)(micros() - next) < 0) {}
+      if (prof::on) prof::txTick(micros() - next);
       next += 62 + (k & 1);                               // 62.5 us
       setFrf(frf0 + d);
       if ((k & 255) == 0 && stopNow()) { stopped = true; break; }
@@ -2616,6 +2679,7 @@ static void serialCommands() {
       queuedListen = a; queuedAm = w[0] == 'a';
       queuedExact = strlen(line) > 2 && !strcmp(line + strlen(line) - 2, " x");
     }
+    else if (!strcmp(line, "timing on") || !strcmp(line, "timing off")) prof::set(line[8] == 'n');
     else if (!strcmp(line, "speed fast") || !strcmp(line, "speed slow")) queuedSlow = line[6] == 's';
     else if (!strcmp(line, "log")) queuedLog = 10;
     else if (sscanf(line, "log %d", &a) == 1 && a > 0) queuedLog = a;
@@ -2741,6 +2805,7 @@ void setup() {
 
 void loop() {
   serialCommands();
+  prof::tick();
   detlog::flush();
   if (queuedLog) { int n = queuedLog; queuedLog = 0; detlog::flush(true); detlog::tail(n); }
   if (queuedProbe) { int f = queuedProbe; queuedProbe = 0; probe(f); return; }

@@ -117,6 +117,13 @@ tools/build.sh flash COM4   # build, then write it to a board
 On Windows, `tools\dev.ps1 -Flash -Log 60` builds, flashes and shows 60 seconds of
 filtered serial output in one step.
 
+**Timing.** Send `timing on` over serial (or from the BLE remote) and every 2 seconds the
+board prints where its time goes: the radio part of each sweep, the drawing done inside
+the sweep and how often it made a step overrun its settle wait, the drawing and BLE work
+after each sweep, late listen batches and samples, FIFO overruns, and late TX ticks.
+`timing off` stops it. This is to measure what moving drawing onto the second core would
+gain before doing it.
+
 ## Reusing the UI
 
 `src/han_ui.h` is the H@N-CYD-GBC menu look in one file: themes, the gradient header
